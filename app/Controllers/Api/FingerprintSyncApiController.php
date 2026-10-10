@@ -1,0 +1,214 @@
+<?php
+declare(strict_types=1);
+
+namespace App\Controllers\Api;
+
+use App\Controllers\Controller;
+use App\Core\Auth;
+use App\Core\Config;
+use App\Core\Request;
+use App\Core\Logger;
+use App\Core\Response;
+use App\Services\FingerprintSyncService;
+
+/**
+ * Handing a terminal the templates it is missing.
+ *
+ * A sensor can only match what is in its own flash, so a teacher enrolled in
+ * Room 101 was unknown to the reader in Room 102. This is how the template
+ * gets there: the terminal asks what it is short of, writes what it is given
+ * into its sensor, and confirms.
+ *
+ * Pull, not push — the same shape as enrolment and card issuance. The server
+ * never opens a connection to a terminal, so a terminal that is switched off
+ * collects its backlog when it returns rather than needing the server to track
+ * retries.
+ *
+ * This route sends biometric templates over the wire, which nothing else in
+ * this system does. What guards it:
+ *
+ *   · the full device-auth chain — a registered device id, a valid API key, an
+ *     HMAC signature over the request, a fresh timestamp and a single-use
+ *     nonce. A terminal cannot ask on another terminal's behalf, because the
+ *     device it is answered for comes from the authenticated identity and
+ *     never from the request body.
+ *   · one template per call, addressed to one slot on that terminal.
+ *   · TLS in any deployment that has it. On a plain-HTTP LAN this is the one
+ *     endpoint where that choice actually costs something, and DEPLOYMENT.md
+ *     says so.
+ */
+final class FingerprintSyncApiController extends Controller
+{
+    /**
+     * GET /api/fingerprint/sync — the next template this terminal is missing.
+     *
+     * One at a time. Writing a template is a multi-packet UART transfer that
+     * blocks the terminal's loop; a terminal that disappears for the length of
+     * a twenty-template backlog is a terminal that misses taps. One per poll
+     * keeps the reader responsive while the backlog drains.
+     */
+    public function pending(Request $httpRequest): Response
+    {
+        $device = Auth::device();
+
+        // A wipe comes before everything else. There is no sense handing a
+        // terminal templates it is about to erase, and the refill afterwards
+        // is what makes the wipe survivable — so the order matters.
+        if (FingerprintSyncService::wipeRequestedFor((int) $device['id'])) {
+            return $this->json([
+                'template'     => null,
+                'upload'       => null,
+                'wipe_sensor'  => true,
+                'poll_seconds' => (int) Config::get('attendance.fingerprint.sync_poll_seconds', 15),
+            ], 'Erase the sensor and confirm.');
+        }
+
+        $next = FingerprintSyncService::nextPendingFor((int) $device['id']);
+
+        if ($next === null) {
+            // Nothing to give this terminal — so ask whether it has anything
+            // the server is missing. Enrolments made before templates were
+            // stored left the bytes in one sensor and nowhere else, and the
+            // sensor that holds them can read them back without a finger.
+            // Recovering them this way costs nobody a trip to a reader, which
+            // matters at forty teachers rather than one.
+            $wanted = FingerprintSyncService::nextBackfillFor((int) $device['id']);
+
+            return $this->json([
+                'template'     => null,
+                'upload'       => $wanted === null ? null : [
+                    'slot'         => $wanted['slot'],
+                    'teacher_name' => $wanted['teacher'],
+                ],
+                'wipe_sensor'  => false,
+                'poll_seconds' => (int) Config::get('attendance.fingerprint.sync_poll_seconds', 15),
+            ], $wanted === null ? 'Nothing to sync.' : 'Send back the template in this slot.');
+        }
+
+        return $this->json([
+            'template' => [
+                'slot'         => $next['slot'],
+                'bytes'        => $next['bytes'],
+                'data'         => $next['template'],
+                'teacher_name' => $next['teacher'],
+            ],
+            'upload'       => null,
+            'wipe_sensor'  => false,
+            'poll_seconds' => (int) Config::get('attendance.fingerprint.sync_poll_seconds', 15),
+        ], 'Template to store.');
+    }
+
+    /**
+     * POST /api/fingerprint/sync/captured — a terminal handing back a template
+     * it already held.
+     *
+     * The other direction of the same route. This is how an enrolment made
+     * before the server kept templates is recovered: the terminal that did
+     * the original capture reads the slot out of its own flash and uploads it,
+     * and the teacher reaches every other room without being asked to stand
+     * at a reader again.
+     *
+     * The slot is checked against what the server already believes that device
+     * holds. A terminal cannot attach a template to a teacher of its choosing.
+     */
+    public function captured(Request $httpRequest): Response
+    {
+        $device = Auth::device();
+
+        $data = $this->validate($httpRequest, [
+            'slot'     => 'required|int|between:1,999',
+            'template' => 'required|string|max:4096',
+        ], [
+            'slot' => 'Sensor slot',
+        ]);
+
+        $stored = FingerprintSyncService::acceptBackfill(
+            (int) $device['id'],
+            (int) $data['slot'],
+            (string) $data['template']
+        );
+
+        if (!$stored) {
+            return Response::fail(
+                'TEMPLATE_REJECTED',
+                'That template was not accepted. The slot is not recorded against a teacher on '
+                . 'this terminal, or the bytes did not arrive intact.',
+                422
+            );
+        }
+
+        return $this->json([], 'Template recovered from the sensor.');
+    }
+
+    /**
+     * POST /api/fingerprint/sync/stored — the terminal confirming it wrote one.
+     *
+     * The confirmation is what marks the slot present, not the fact that the
+     * template was sent. A sensor whose flash has stopped accepting writes
+     * acknowledges a store and keeps nothing, so the firmware reads the slot
+     * back before calling this — and a slot marked present on the strength of
+     * having been *offered* would leave a teacher unable to open their class
+     * with nothing anywhere saying why.
+     */
+    public function stored(Request $httpRequest): Response
+    {
+        $device = Auth::device();
+
+        $data = $this->validate($httpRequest, [
+            'slot'   => 'required|int|between:1,999',
+            'stored' => 'required|bool',
+            'reason' => 'nullable|string|max:255',
+        ], [
+            'slot' => 'Sensor slot',
+        ]);
+
+        $slot = (int) $data['slot'];
+
+        if ((bool) $data['stored']) {
+            FingerprintSyncService::markStored((int) $device['id'], $slot);
+
+            return $this->json([], 'Template recorded as present.');
+        }
+
+        FingerprintSyncService::markFailed(
+            (int) $device['id'],
+            $slot,
+            (string) ($data['reason'] ?? 'The terminal reported the write failed.')
+        );
+
+        return $this->json([], 'Failure recorded.');
+    }
+
+    /**
+     * POST /api/fingerprint/sync/wiped — the terminal reports its sensor is empty.
+     *
+     * Only the confirmation clears the request. A terminal that was asked to
+     * wipe and then lost power must be asked again on its next poll, because
+     * the alternative — assuming it worked — leaves orphan templates in a
+     * sensor the page now claims is clean, which is the failure this whole
+     * feature exists to end.
+     */
+    public function wiped(Request $httpRequest): Response
+    {
+        $device = Auth::device();
+
+        $data = $this->validate($httpRequest, [
+            'wiped'  => 'required|bool',
+            'reason' => 'nullable|string|max:255',
+        ]);
+
+        if (!(bool) $data['wiped']) {
+            Logger::warning('Sensor wipe failed on the terminal', [
+                'device_row_id' => (int) $device['id'],
+                'reason'        => (string) ($data['reason'] ?? ''),
+            ]);
+
+            // The request stays set, so it is retried rather than forgotten.
+            return $this->json([], 'Failure recorded; the wipe will be requested again.');
+        }
+
+        FingerprintSyncService::confirmSensorWipe((int) $device['id']);
+
+        return $this->json([], 'Sensor recorded as empty; templates will be rewritten.');
+    }
+}
