@@ -21,12 +21,7 @@
 -- from 0, which means the terminal answered and its sensor is empty.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
-ALTER TABLE devices
-    ADD COLUMN sensor_template_count SMALLINT UNSIGNED NULL DEFAULT NULL
-        COMMENT 'Templates the fingerprint sensor reported holding at the last heartbeat; NULL if never reported'
-        AFTER queue_depth,
-    ADD COLUMN sensor_reported_at DATETIME NULL DEFAULT NULL
-        COMMENT 'When that count last arrived'
-        AFTER sensor_template_count;
+ALTER TABLE devices ADD COLUMN sensor_template_count INTEGER;  -- Templates the fingerprint sensor reported holding at the last heartbeat; NULL if never reported
+ALTER TABLE devices ADD COLUMN sensor_reported_at TEXT;  -- When that count last arrived
+

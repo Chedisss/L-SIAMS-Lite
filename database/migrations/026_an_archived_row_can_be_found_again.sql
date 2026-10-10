@@ -21,7 +21,8 @@
 -- view. Dropping the WHERE here is what makes the existing option honest.
 -- ---------------------------------------------------------------------------
 
-CREATE OR REPLACE VIEW v_section_summary AS
+DROP VIEW IF EXISTS v_section_summary;
+CREATE VIEW v_section_summary AS
 SELECT
   sec.section_id,
   sec.section_code,
@@ -32,9 +33,9 @@ SELECT
   sec.strand,
   sec.capacity,
   sec.enrolled_count,
-  ROUND(sec.enrolled_count / NULLIF(sec.capacity, 0) * 100, 1) AS capacity_percent,
+  ROUND(sec.enrolled_count * 100.0 / NULLIF(sec.capacity, 0), 1) AS capacity_percent,
   sec.adviser_id,
-  CONCAT(t.last_name, ', ', t.first_name) AS adviser_name,
+  t.last_name || ', ' || t.first_name AS adviser_name,
   sec.status,
   -- Exposed, not filtered. Every caller must now say which it wants, which is
   -- the point: the archived rows are reachable and the live lists still
@@ -46,11 +47,12 @@ SELECT
      JOIN rfid_cards rc ON rc.student_id = st.student_id AND rc.status = 'active'
     WHERE st.section_id = sec.section_id AND st.deleted_at IS NULL AND st.status = 'active') AS students_with_cards,
   (SELECT ROUND(
-            SUM(CASE WHEN ar.final_status IN ('Present','Late') THEN 1 ELSE 0 END)
-            / NULLIF(COUNT(*), 0) * 100, 2)
+            SUM(CASE WHEN ar.final_status IN ('Present','Late') THEN 1 ELSE 0 END) * 100.0
+            / NULLIF(COUNT(*), 0), 2)
      FROM attendance_records ar
     WHERE ar.section_id = sec.section_id
-      AND ar.time_in >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)) AS attendance_percentage_30d
+      AND ar.time_in >= date(curdate(), '-30 days')) AS attendance_percentage_30d
 FROM sections sec
 JOIN grade_levels gl ON gl.grade_level_id = sec.grade_level_id
 LEFT JOIN teachers t ON t.teacher_id = sec.adviser_id;
+

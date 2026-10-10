@@ -22,17 +22,11 @@
 -- change does not report module health, and "did not say" must not be stored
 -- as "said no" — that would paint every terminal on older firmware as broken.
 
-ALTER TABLE devices
-    ADD COLUMN rfid_ok TINYINT(1) NULL DEFAULT NULL
-        COMMENT 'Card reader answered at boot. NULL = firmware did not report.'
-        AFTER sensor_reported_at,
-    ADD COLUMN fingerprint_ok TINYINT(1) NULL DEFAULT NULL
-        COMMENT 'Fingerprint sensor answered at boot. NULL = firmware did not report.'
-        AFTER rfid_ok,
-    ADD COLUMN modules_reported_at DATETIME NULL DEFAULT NULL
-        COMMENT 'When the two columns above were last written.'
-        AFTER fingerprint_ok;
+ALTER TABLE devices ADD COLUMN rfid_ok INTEGER;  -- Card reader answered at boot. NULL = firmware did not report.
+ALTER TABLE devices ADD COLUMN fingerprint_ok INTEGER;  -- Fingerprint sensor answered at boot. NULL = firmware did not report.
+ALTER TABLE devices ADD COLUMN modules_reported_at TEXT;  -- When the two columns above were last written.
 
 -- Finding the terminals worth chasing: a module that reported itself as failed
 -- is a maintenance queue, and it is a short list against a long table.
 CREATE INDEX idx_devices_module_health ON devices (rfid_ok, fingerprint_ok);
+

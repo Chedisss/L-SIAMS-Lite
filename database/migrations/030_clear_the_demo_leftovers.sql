@@ -24,20 +24,19 @@
 -- classes every day for a subject that had been removed. Doing it in the right
 -- order here is the same order the interface would force.
 
-UPDATE schedules sch
-  JOIN subjects s ON s.subject_id = sch.subject_id
-   SET sch.status = 'archived', sch.deleted_at = NOW(), sch.updated_at = NOW()
- WHERE s.subject_code IN ('ENG07','FIL07','MATH07','SCIE07','VAL07')
-   AND sch.status = 'active'
-   AND sch.deleted_at IS NULL;
+-- SQLite has no UPDATE ... JOIN; the join becomes a subquery on the same rows.
+UPDATE schedules
+   SET status = 'archived', deleted_at = NOW(), updated_at = NOW()
+ WHERE subject_id IN (SELECT subject_id FROM subjects WHERE subject_code IN ('ENG07','FIL07','MATH07','SCIE07','VAL07'))
+   AND status = 'active'
+   AND deleted_at IS NULL;
 
 -- --------------------------------------------- the qualifications that go too
 -- Left behind, these would put the subject back in a teacher's list the moment
 -- anybody restored it, with nobody having decided that.
 
-DELETE ts FROM teacher_subjects ts
-  JOIN subjects s ON s.subject_id = ts.subject_id
- WHERE s.subject_code IN ('ENG07','FIL07','MATH07','SCIE07','VAL07');
+DELETE FROM teacher_subjects
+ WHERE subject_id IN (SELECT subject_id FROM subjects WHERE subject_code IN ('ENG07','FIL07','MATH07','SCIE07','VAL07'));
 
 -- ------------------------------------------------------ the duplicates
 UPDATE subjects
@@ -55,19 +54,19 @@ UPDATE subjects
 -- the same two conditions, so this cannot remove anything the interface would
 -- have refused to.
 
-UPDATE classrooms c
-   SET c.status = 'inactive', c.deleted_at = NOW(), c.updated_at = NOW()
- WHERE c.room_number IN ('103','104','105')
-   AND c.deleted_at IS NULL
+UPDATE classrooms
+   SET status = 'inactive', deleted_at = NOW(), updated_at = NOW()
+ WHERE room_number IN ('103','104','105')
+   AND deleted_at IS NULL
    AND NOT EXISTS (
          SELECT 1 FROM devices d
-          WHERE d.classroom_id = c.classroom_id
+          WHERE d.classroom_id = classrooms.classroom_id
             AND d.deleted_at IS NULL
             AND d.status <> 'decommissioned'
        )
    AND NOT EXISTS (
          SELECT 1 FROM schedules sch
-          WHERE sch.classroom_id = c.classroom_id
+          WHERE sch.classroom_id = classrooms.classroom_id
             AND sch.status = 'active'
             AND sch.deleted_at IS NULL
        );

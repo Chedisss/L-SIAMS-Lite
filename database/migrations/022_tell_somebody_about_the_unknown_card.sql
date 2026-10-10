@@ -24,15 +24,9 @@
 -- repeating itself is noise from something they have already answered.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
-ALTER TABLE unknown_rfid_logs
-    ADD COLUMN last_notified_at DATETIME NULL DEFAULT NULL
-        COMMENT 'When an administrator was last alerted about this UID'
-        AFTER last_seen_at,
-    ADD COLUMN notified_count INT UNSIGNED NOT NULL DEFAULT 0
-        COMMENT 'How many alerts this UID has produced'
-        AFTER last_notified_at;
+ALTER TABLE unknown_rfid_logs ADD COLUMN last_notified_at TEXT;  -- When an administrator was last alerted about this UID
+ALTER TABLE unknown_rfid_logs ADD COLUMN notified_count INTEGER NOT NULL DEFAULT 0;  -- How many alerts this UID has produced
 
 -- ---------------------------------------------------------------------------
 -- Settings
@@ -59,4 +53,5 @@ VALUES
      'Unknown card repeat threshold',
      'After this many sightings of the same unrecognised card, the alert is raised as high priority and logged as a security event rather than an enrolment gap.',
      0, '2', '100')
-ON DUPLICATE KEY UPDATE setting_key = setting_key;
+ON CONFLICT DO NOTHING;
+

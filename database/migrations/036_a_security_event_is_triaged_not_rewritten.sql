@@ -25,34 +25,34 @@
 -- Only its resolution status and the administrator's note can move.
 -- ---------------------------------------------------------------------------
 
-DELIMITER $$
 
-DROP TRIGGER IF EXISTS trg_security_immutable_content $$
+DROP TRIGGER IF EXISTS trg_security_immutable_content;
 
+-- IS NOT is SQLite's NULL-safe inequality, MariaDB's NOT (a <=> b).
+--
+-- One allowance MariaDB never needed: device_row_id may become NULL.
+-- fk_seclog_device is ON DELETE SET NULL, and where MariaDB carries out a
+-- foreign-key action without running triggers, SQLite runs them — so without
+-- this, removing a device that ever appeared in a security event would be
+-- refused here. Any other change to it is still rejected.
 CREATE TRIGGER trg_security_immutable_content
 BEFORE UPDATE ON security_logs
-FOR EACH ROW
+WHEN NEW.security_id     IS NOT OLD.security_id
+  OR NEW.event           IS NOT OLD.event
+  OR NEW.severity        IS NOT OLD.severity
+  OR NEW.description     IS NOT OLD.description
+  OR NEW.context_json    IS NOT OLD.context_json
+  OR NEW.source_ip       IS NOT OLD.source_ip
+  OR NEW.user_id         IS NOT OLD.user_id
+  OR (NEW.device_row_id  IS NOT OLD.device_row_id AND NEW.device_row_id IS NOT NULL)
+  OR NEW.device_id_text  IS NOT OLD.device_id_text
+  OR NEW.endpoint        IS NOT OLD.endpoint
+  OR NEW.http_method     IS NOT OLD.http_method
+  OR NEW.user_agent      IS NOT OLD.user_agent
+  OR NEW.created_at      IS NOT OLD.created_at
 BEGIN
-  -- Everything that says what the event WAS is frozen. `<=>` is the
-  -- null-safe comparison, so a column that is NULL on both sides counts as
-  -- unchanged rather than tripping the guard.
-  IF  NEW.security_id    <> OLD.security_id
-  OR  NEW.event          <> OLD.event
-  OR  NEW.severity       <> OLD.severity
-  OR  NOT (NEW.description   <=> OLD.description)
-  OR  NOT (NEW.context_json  <=> OLD.context_json)
-  OR  NOT (NEW.source_ip     <=> OLD.source_ip)
-  OR  NOT (NEW.user_id       <=> OLD.user_id)
-  OR  NOT (NEW.device_row_id <=> OLD.device_row_id)
-  OR  NOT (NEW.device_id_text <=> OLD.device_id_text)
-  OR  NOT (NEW.endpoint      <=> OLD.endpoint)
-  OR  NOT (NEW.http_method   <=> OLD.http_method)
-  OR  NOT (NEW.user_agent    <=> OLD.user_agent)
-  OR  NOT (NEW.created_at    <=> OLD.created_at)
-  THEN
-    SIGNAL SQLSTATE '45000'
-      SET MESSAGE_TEXT = 'A security event is immutable except for its resolution status and notes.';
-  END IF;
-END $$
+    SELECT RAISE(ABORT, 'A security event is immutable except for its resolution status and notes.');
+END;
 
-DELIMITER ;
+
+

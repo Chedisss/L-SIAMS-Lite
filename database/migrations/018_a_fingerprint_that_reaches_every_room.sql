@@ -45,48 +45,56 @@
 -- others; the Fingerprints page can find them with template_data IS NULL.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
-ALTER TABLE fingerprint_templates
-    ADD COLUMN template_data MEDIUMTEXT NULL DEFAULT NULL
-        COMMENT 'The sensor template, encrypted with the app key. NULL for enrolments made before sync existed.'
-        AFTER sensor_template_id,
-    ADD COLUMN template_bytes SMALLINT UNSIGNED NULL DEFAULT NULL
-        COMMENT 'Plaintext length in bytes, so a truncated upload is caught before it is written to a sensor'
-        AFTER template_data,
-    ADD COLUMN template_captured_at DATETIME NULL DEFAULT NULL
-        AFTER template_bytes;
+ALTER TABLE fingerprint_templates ADD COLUMN template_data TEXT COLLATE NOCASE;  -- The sensor template, encrypted with the app key. NULL for enrolments made before sync existed.
+ALTER TABLE fingerprint_templates ADD COLUMN template_bytes INTEGER;  -- Plaintext length in bytes, so a truncated upload is caught before it is written to a sensor
+ALTER TABLE fingerprint_templates ADD COLUMN template_captured_at TEXT;
 
 CREATE TABLE IF NOT EXISTS fingerprint_slots (
-  slot_row_id       INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  fingerprint_id    INT UNSIGNED NOT NULL,
-  device_row_id     INT UNSIGNED NOT NULL,
-  sensor_template_id SMALLINT UNSIGNED NOT NULL COMMENT 'The slot this sensor holds it in. Per-sensor: meaningless without device_row_id.',
-  -- 'enrolled' is the sensor the finger was actually presented to; 'synced' is
-  -- a copy this server pushed. Worth distinguishing: a sync that silently
-  -- failed leaves a row claiming a template the sensor does not have, and the
-  -- heartbeat's template count is how that gets noticed.
-  source            ENUM('enrolled','synced') NOT NULL DEFAULT 'synced',
-  status            ENUM('pending','present','failed') NOT NULL DEFAULT 'pending',
-  last_error        VARCHAR(255) NULL,
-  synced_at         DATETIME NULL,
-  created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  -- One template per slot on a given sensor, and one slot per template on a
-  -- given sensor. Both directions, because both are corruption.
-  UNIQUE KEY uq_slot_on_device (device_row_id, sensor_template_id),
-  UNIQUE KEY uq_template_on_device (fingerprint_id, device_row_id),
-  KEY idx_slot_pending (device_row_id, status),
-  CONSTRAINT fk_slot_fingerprint FOREIGN KEY (fingerprint_id) REFERENCES fingerprint_templates(fingerprint_id)
-      ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT fk_slot_device      FOREIGN KEY (device_row_id)  REFERENCES devices(id)
-      ON UPDATE CASCADE ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    slot_row_id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_id               INTEGER NOT NULL,
+    device_row_id                INTEGER NOT NULL,
+    sensor_template_id           INTEGER NOT NULL,  -- The slot this sensor holds it in. Per-sensor: meaningless without device_row_id.
+    -- 'enrolled' is the sensor the finger was actually presented to; 'synced' is
+    -- a copy this server pushed. Worth distinguishing: a sync that silently
+    -- failed leaves a row claiming a template the sensor does not have, and the
+    -- heartbeat's template count is how that gets noticed.
+    source                       TEXT NOT NULL DEFAULT 'synced' COLLATE NOCASE CHECK (source IN ('enrolled', 'synced')),
+    status                       TEXT NOT NULL DEFAULT 'pending' COLLATE NOCASE CHECK (status IN ('pending', 'present', 'failed')),
+    last_error                   TEXT COLLATE NOCASE,
+    synced_at                    TEXT,
+    created_at                   TEXT NOT NULL DEFAULT (now()),
+    updated_at                   TEXT NOT NULL DEFAULT (now()),
+    CONSTRAINT fk_slot_fingerprint FOREIGN KEY (fingerprint_id) REFERENCES fingerprint_templates (fingerprint_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_slot_device FOREIGN KEY (device_row_id) REFERENCES devices (id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+-- One template per slot on a given sensor, and one slot per template on a
+-- given sensor. Both directions, because both are corruption.
+CREATE UNIQUE INDEX uq_slot_on_device ON fingerprint_slots (device_row_id, sensor_template_id);
+CREATE UNIQUE INDEX uq_template_on_device ON fingerprint_slots (fingerprint_id, device_row_id);
+CREATE INDEX idx_slot_pending ON fingerprint_slots (device_row_id, status);
+
+CREATE TRIGGER trg_fingerprint_slots_updated_at
+AFTER UPDATE ON fingerprint_slots
+FOR EACH ROW WHEN NEW.updated_at IS OLD.updated_at AND (
+    NEW.slot_row_id IS NOT OLD.slot_row_id
+    OR NEW.fingerprint_id IS NOT OLD.fingerprint_id
+    OR NEW.device_row_id IS NOT OLD.device_row_id
+    OR NEW.sensor_template_id IS NOT OLD.sensor_template_id
+    OR NEW.source IS NOT OLD.source
+    OR NEW.status IS NOT OLD.status
+    OR NEW.last_error IS NOT OLD.last_error
+    OR NEW.synced_at IS NOT OLD.synced_at
+    OR NEW.created_at IS NOT OLD.created_at
+)
+BEGIN
+    UPDATE fingerprint_slots SET updated_at = now() WHERE slot_row_id = NEW.slot_row_id;
+END;
 
 -- Backfill. Every enrolment that already names the terminal it was made on
 -- becomes the 'enrolled' row for that terminal, marked present because the
 -- sensor genuinely does hold it.
-INSERT IGNORE INTO fingerprint_slots
+INSERT OR IGNORE INTO fingerprint_slots
     (fingerprint_id, device_row_id, sensor_template_id, source, status, synced_at, created_at)
 SELECT fp.fingerprint_id,
        fp.enrolled_device_row_id,
@@ -102,6 +110,5 @@ SELECT fp.fingerprint_id,
 -- yet — the template sits in the sensor while somebody finishes the form. The
 -- bytes have to wait somewhere too, or they are lost at exactly the moment the
 -- teacher is created and the sync would otherwise begin.
-ALTER TABLE fingerprint_enrollment_requests
-    ADD COLUMN template_data MEDIUMTEXT NULL DEFAULT NULL
-        COMMENT 'Encrypted template held between capture and bind(); cleared once it reaches fingerprint_templates';
+ALTER TABLE fingerprint_enrollment_requests ADD COLUMN template_data TEXT COLLATE NOCASE;  -- Encrypted template held between capture and bind(); cleared once it reaches fingerprint_templates
+

@@ -24,9 +24,9 @@
 -- question for the administrator rather than something to invent here.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
 UPDATE devices
    SET enrollment_station = 0,
        updated_at = NOW()
  WHERE enrollment_station <> 0;
+

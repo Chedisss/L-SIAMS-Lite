@@ -22,27 +22,72 @@
 -- done".
 -- ---------------------------------------------------------------------------
 
-ALTER TABLE rfid_cards
-  ADD COLUMN IF NOT EXISTS released_student_id INT UNSIGNED NULL
-    COMMENT 'Who last held this card before it went back to stock'
-    AFTER student_id,
-  ADD COLUMN IF NOT EXISTS released_at DATETIME NULL
-    COMMENT 'When it was released; NULL for a card never released'
-    AFTER released_student_id;
+-- The two columns, fk_rfid_released_student and its index arrive in one
+-- rebuild: SQLite cannot add a named foreign key to an existing table. The
+-- IF NOT EXISTS / IF EXISTS guards are not needed here — a failed migration is
+-- rolled back whole, so a retry always starts from the previous state.
+-- The table is rebuilt: a new one in the final shape, the rows copied across,
+-- the old one dropped and the new one renamed into its place. Indexes and
+-- triggers go with the old table, so they are recreated after.
+CREATE TABLE rfid_cards__new (
+    rfid_id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id                   INTEGER,
+    released_student_id          INTEGER,
+    released_at                  TEXT,
+    card_uid                     TEXT NOT NULL COLLATE NOCASE,
+    issue_date                   TEXT NOT NULL,
+    replacement_date             TEXT,
+    replacement_reason           TEXT COLLATE NOCASE CHECK (replacement_reason IN ('lost', 'damaged', 'stolen', 'not_returned', 'other')),
+    replacement_note             TEXT COLLATE NOCASE,
+    replaced_rfid_id             INTEGER,
+    status                       TEXT NOT NULL DEFAULT 'active' COLLATE NOCASE CHECK (status IN ('active', 'inactive', 'lost', 'blacklisted', 'replaced')),
+    notes                        TEXT COLLATE NOCASE,
+    issued_by                    INTEGER,
+    created_at                   TEXT NOT NULL DEFAULT (now()),
+    updated_at                   TEXT NOT NULL DEFAULT (now()),
+    active_student_id            INTEGER GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN student_id ELSE NULL END) STORED,
+    CONSTRAINT fk_rfid_issuer FOREIGN KEY (issued_by) REFERENCES users (user_id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_rfid_previous FOREIGN KEY (replaced_rfid_id) REFERENCES rfid_cards (rfid_id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_rfid_released_student FOREIGN KEY (released_student_id) REFERENCES students (student_id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_rfid_student FOREIGN KEY (student_id) REFERENCES students (student_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+);
+INSERT INTO rfid_cards__new (rfid_id, student_id, card_uid, issue_date, replacement_date, replacement_reason, replacement_note, replaced_rfid_id, status, notes, issued_by, created_at, updated_at)
+    SELECT rfid_id, student_id, card_uid, issue_date, replacement_date, replacement_reason, replacement_note, replaced_rfid_id, status, notes, issued_by, created_at, updated_at FROM rfid_cards;
+DROP TABLE rfid_cards;
+ALTER TABLE rfid_cards__new RENAME TO rfid_cards;
+CREATE INDEX fk_rfid_issuer ON rfid_cards (issued_by);
+CREATE INDEX fk_rfid_previous ON rfid_cards (replaced_rfid_id);
+CREATE INDEX idx_rfid_released ON rfid_cards (released_student_id);
+CREATE INDEX idx_rfid_replacement_reason ON rfid_cards (replacement_reason, replacement_date);
+CREATE INDEX idx_rfid_status ON rfid_cards (status);
+CREATE INDEX idx_rfid_student ON rfid_cards (student_id, status);
+CREATE UNIQUE INDEX uq_one_active_card_per_student ON rfid_cards (active_student_id);
+CREATE UNIQUE INDEX uq_rfid_uid ON rfid_cards (card_uid);
 
--- Dropped before it is added, which is how a constraint gets added idempotently
--- without a prepared statement: MariaDB has DROP FOREIGN KEY IF EXISTS but no
--- ADD CONSTRAINT IF NOT EXISTS, and a migration that fails part-way is re-run
--- from the top. The obvious alternative — SET @x := (SELECT ...) then PREPARE —
--- leaves an unbuffered result set the runner cannot step past, and fails the
--- migration on the statement after it rather than on this one.
-ALTER TABLE rfid_cards DROP FOREIGN KEY IF EXISTS fk_rfid_released_student;
+CREATE TRIGGER trg_rfid_cards_updated_at
+AFTER UPDATE ON rfid_cards
+FOR EACH ROW WHEN NEW.updated_at IS OLD.updated_at AND (
+    NEW.rfid_id IS NOT OLD.rfid_id
+    OR NEW.student_id IS NOT OLD.student_id
+    OR NEW.released_student_id IS NOT OLD.released_student_id
+    OR NEW.released_at IS NOT OLD.released_at
+    OR NEW.card_uid IS NOT OLD.card_uid
+    OR NEW.issue_date IS NOT OLD.issue_date
+    OR NEW.replacement_date IS NOT OLD.replacement_date
+    OR NEW.replacement_reason IS NOT OLD.replacement_reason
+    OR NEW.replacement_note IS NOT OLD.replacement_note
+    OR NEW.replaced_rfid_id IS NOT OLD.replaced_rfid_id
+    OR NEW.status IS NOT OLD.status
+    OR NEW.notes IS NOT OLD.notes
+    OR NEW.issued_by IS NOT OLD.issued_by
+    OR NEW.created_at IS NOT OLD.created_at
+)
+BEGIN
+    UPDATE rfid_cards SET updated_at = now() WHERE rfid_id = NEW.rfid_id;
+END;
+-- Views that read rfid_cards are untouched: the runner renames with legacy_alter_table,
+-- which leaves them pointing at the name, not the dropped table.
 
-ALTER TABLE rfid_cards
-  ADD CONSTRAINT fk_rfid_released_student FOREIGN KEY (released_student_id)
-    REFERENCES students(student_id) ON UPDATE CASCADE ON DELETE SET NULL;
-
-CREATE INDEX IF NOT EXISTS idx_rfid_released ON rfid_cards (released_student_id);
 
 -- ------------------------------------------------------ recover what was lost
 -- Cards released before this migration had their holder cleared with nothing
@@ -56,23 +101,29 @@ CREATE INDEX IF NOT EXISTS idx_rfid_released ON rfid_cards (released_student_id)
 --
 -- Only the most recent release per card is used, and only where the student
 -- still exists; a card released twice is described by the last release.
-UPDATE rfid_cards rc
-   JOIN (
-        SELECT record_id,
-               MAX(audit_id) AS audit_id
-          FROM audit_logs
-         WHERE action = 'RFID_RELEASED'
-           AND record_type = 'rfid_card'
-         GROUP BY record_id
-        -- Compared as numbers, not as strings. record_id is a varchar in
-        -- utf8mb4_unicode_ci and CAST(... AS CHAR) yields utf8mb4_general_ci,
-        -- so the string form raises "illegal mix of collations".
-   ) latest ON CAST(latest.record_id AS UNSIGNED) = rc.rfid_id
-   JOIN audit_logs a ON a.audit_id = latest.audit_id
-   JOIN students st
-     ON st.student_id = CAST(JSON_UNQUOTE(JSON_EXTRACT(a.old_value, '$.student_id')) AS UNSIGNED)
-    SET rc.released_student_id = st.student_id,
-        rc.released_at         = a.created_at
-  WHERE rc.released_student_id IS NULL
-    AND JSON_VALID(a.old_value)
-    AND JSON_EXTRACT(a.old_value, '$.student_id') IS NOT NULL;
+-- SQLite has no UPDATE ... JOIN, so the same three joins become a CTE that
+-- names, for each released card, the student its latest RFID_RELEASED audit
+-- entry recorded. json_extract() is only reached through json_valid(), as the
+-- MariaDB version guarded JSON_EXTRACT() with JSON_VALID().
+WITH latest AS (
+    SELECT CAST(record_id AS INTEGER) AS rfid_id,
+           MAX(audit_id)             AS audit_id
+      FROM audit_logs
+     WHERE action = 'RFID_RELEASED'
+       AND record_type = 'rfid_card'
+     GROUP BY record_id
+),
+released AS (
+    SELECT latest.rfid_id, st.student_id, a.created_at
+      FROM latest
+      JOIN audit_logs a ON a.audit_id = latest.audit_id
+      JOIN students st
+        ON st.student_id = CAST(CASE WHEN json_valid(a.old_value)
+                                     THEN json_extract(a.old_value, '$.student_id') END AS INTEGER)
+)
+UPDATE rfid_cards
+   SET released_student_id = (SELECT r.student_id FROM released r WHERE r.rfid_id = rfid_cards.rfid_id),
+       released_at         = (SELECT r.created_at FROM released r WHERE r.rfid_id = rfid_cards.rfid_id)
+ WHERE released_student_id IS NULL
+   AND rfid_id IN (SELECT rfid_id FROM released);
+

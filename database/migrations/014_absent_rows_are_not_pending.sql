@@ -23,7 +23,6 @@
 -- in-progress record in an open session is left alone.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
 UPDATE attendance_records
    SET departure_status = 'no_time_out'
@@ -31,3 +30,4 @@ UPDATE attendance_records
    AND departure_status = 'pending'
    AND time_in  IS NULL
    AND time_out IS NULL;
+

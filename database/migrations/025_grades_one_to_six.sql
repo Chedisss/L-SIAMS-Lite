@@ -22,9 +22,8 @@
 -- half way through.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
-INSERT IGNORE INTO grade_levels (grade_level_code, grade_level_name, numeric_level, track, status)
+INSERT OR IGNORE INTO grade_levels (grade_level_code, grade_level_name, numeric_level, track, status)
 VALUES
     ('G1', 'Grade 1', 1, NULL, 'active'),
     ('G2', 'Grade 2', 2, NULL, 'active'),
@@ -32,3 +31,4 @@ VALUES
     ('G4', 'Grade 4', 4, NULL, 'active'),
     ('G5', 'Grade 5', 5, NULL, 'active'),
     ('G6', 'Grade 6', 6, NULL, 'active');
+

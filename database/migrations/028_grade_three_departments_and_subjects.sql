@@ -45,7 +45,7 @@
 -- It is created anyway, unused, because a school that later wants Homeroom
 -- Guidance to stand on its own should not have to invent it under pressure.
 
-INSERT IGNORE INTO departments (department_code, department_name, description, status, created_at, updated_at) VALUES
+INSERT OR IGNORE INTO departments (department_code, department_name, description, status, created_at, updated_at) VALUES
   ('ESP',  'Values Education Department',    'Edukasyon sa Pagpapakatao.',                'active', NOW(), NOW()),
   ('ENG',  'English Department',             'Language, literature and communication.',   'active', NOW(), NOW()),
   ('MATH', 'Mathematics Department',         'General mathematics, statistics and calculus.', 'active', NOW(), NOW()),
@@ -76,7 +76,7 @@ INSERT IGNORE INTO departments (department_code, department_name, description, s
 -- (three periods to Computer's two), so English is the department to put her
 -- in, and Computer becomes the exception rather than the other way round.
 
-INSERT IGNORE INTO subjects (subject_code, subject_name, description, department_id, status, created_at, updated_at)
+INSERT OR IGNORE INTO subjects (subject_code, subject_name, description, department_id, status, created_at, updated_at)
 SELECT v.code, v.name, v.descr, d.department_id, 'active', NOW(), NOW()
   FROM (
     SELECT 'VAL03'  AS code, 'Values Education'  AS name, 'Edukasyon sa Pagpapakatao for Grade 3.'        AS descr, 'ESP'  AS dept UNION ALL
@@ -96,9 +96,10 @@ SELECT v.code, v.name, v.descr, d.department_id, 'active', NOW(), NOW()
 -- because a schedule needs a subject offered to the section's grade level.
 -- That is the commonest reason a newly created subject appears to do nothing.
 
-INSERT IGNORE INTO subject_grade_levels (subject_id, grade_level_id, created_at)
+INSERT OR IGNORE INTO subject_grade_levels (subject_id, grade_level_id, created_at)
 SELECT s.subject_id, g.grade_level_id, NOW()
   FROM subjects s
   JOIN grade_levels g ON g.grade_level_code = 'G3'
  WHERE s.subject_code IN ('VAL03','ENG03','MATH03','READ03','COMP03','HGP03','FIL03','SCI03','SOC03')
    AND s.deleted_at IS NULL;
+

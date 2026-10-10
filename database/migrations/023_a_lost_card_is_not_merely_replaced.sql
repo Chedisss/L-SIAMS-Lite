@@ -34,14 +34,8 @@
 -- student is ever issued, because neither is being replaced.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
-ALTER TABLE rfid_cards
-    ADD COLUMN replacement_reason
-        ENUM('lost','damaged','stolen','not_returned','other') NULL DEFAULT NULL
-        COMMENT 'Why this card was taken out of service; NULL while it is in service'
-        AFTER replacement_date,
-    ADD COLUMN replacement_note VARCHAR(255) NULL DEFAULT NULL
-        COMMENT "The administrator's own words; required when the reason is 'other'"
-        AFTER replacement_reason,
-    ADD KEY idx_rfid_replacement_reason (replacement_reason, replacement_date);
+ALTER TABLE rfid_cards ADD COLUMN replacement_reason TEXT COLLATE NOCASE CHECK (replacement_reason IN ('lost', 'damaged', 'stolen', 'not_returned', 'other'));  -- Why this card was taken out of service; NULL while it is in service
+ALTER TABLE rfid_cards ADD COLUMN replacement_note TEXT COLLATE NOCASE;  -- The administrator's own words; required when the reason is 'other'
+CREATE INDEX IF NOT EXISTS idx_rfid_replacement_reason ON rfid_cards (replacement_reason, replacement_date);
+

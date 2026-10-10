@@ -5,8 +5,8 @@
 -- rather than `devices` so they can show health in the same breath.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
-CREATE OR REPLACE VIEW v_device_status AS
+DROP VIEW IF EXISTS v_device_status;
+CREATE VIEW v_device_status AS
 SELECT
   dev.id AS device_row_id,
   dev.device_id,
@@ -26,13 +26,13 @@ SELECT
   dev.status AS configured_status,
   dev.claim_status,
   dev.last_heartbeat_at,
-  TIMESTAMPDIFF(SECOND, dev.last_heartbeat_at, NOW()) AS seconds_since_heartbeat,
+  CAST(strftime('%s', now()) AS INTEGER) - CAST(strftime('%s', dev.last_heartbeat_at) AS INTEGER) AS seconds_since_heartbeat,
   CASE
     WHEN dev.status IN ('disabled','decommissioned','suspended') THEN 'disabled'
     WHEN dev.claim_status <> 'claimed' THEN 'pending'
     WHEN dev.last_heartbeat_at IS NULL THEN 'offline'
-    WHEN TIMESTAMPDIFF(SECOND, dev.last_heartbeat_at, NOW()) <= 45 THEN 'online'
-    WHEN TIMESTAMPDIFF(SECOND, dev.last_heartbeat_at, NOW()) <= 90 THEN 'warning'
+    WHEN CAST(strftime('%s', now()) AS INTEGER) - CAST(strftime('%s', dev.last_heartbeat_at) AS INTEGER) <= 45 THEN 'online'
+    WHEN CAST(strftime('%s', now()) AS INTEGER) - CAST(strftime('%s', dev.last_heartbeat_at) AS INTEGER) <= 90 THEN 'warning'
     ELSE 'offline'
   END AS health,
   dev.ip_allowlist,
@@ -44,7 +44,7 @@ SELECT
   ak.secret_last_four,
   ak.status AS key_status,
   ak.created_at AS key_created_at,
-  DATEDIFF(NOW(), ak.created_at) AS key_age_days,
+  CAST(julianday(date(now())) - julianday(date(ak.created_at)) AS INTEGER) AS key_age_days,
   ak.last_used_at AS key_last_used_at,
   ak.use_count AS key_use_count,
   sess.session_id AS active_session_id,
@@ -60,8 +60,9 @@ LEFT JOIN api_keys ak ON ak.api_key_id = (
       FROM api_keys inner_ak
      WHERE inner_ak.device_row_id = dev.id
        AND inner_ak.status IN ('active','rotating')
-     ORDER BY FIELD(inner_ak.status, 'active', 'rotating'), inner_ak.created_at DESC
+     ORDER BY CASE inner_ak.status WHEN 'active' THEN 1 WHEN 'rotating' THEN 2 ELSE 0 END, inner_ak.created_at DESC
      LIMIT 1
 )
 LEFT JOIN attendance_sessions sess ON sess.device_row_id = dev.id AND sess.status = 'open'
 WHERE dev.deleted_at IS NULL;
+

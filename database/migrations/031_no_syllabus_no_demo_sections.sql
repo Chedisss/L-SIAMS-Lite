@@ -33,18 +33,39 @@
 -- database had no active students in those sections, so the UPDATE matched
 -- nothing, the trigger never fired, and the bug was invisible. Verifying the
 -- end state is not the same as verifying the work happened.
+--
+-- On SQLite neither problem exists — a migration runs in one transaction, DDL
+-- included, so a failure leaves nothing half-done; and a trigger may write to
+-- a table its statement reads. The structure is kept so this file still lines
+-- up with the MariaDB one.
 -- ---------------------------------------------------------------------------
 
-ALTER TABLE subject_grade_levels DROP COLUMN IF EXISTS syllabus;
+-- Dropped by rebuilding: ALTER TABLE ... DROP COLUMN only exists from SQLite 3.35.
+-- The table is rebuilt: a new one in the final shape, the rows copied across,
+-- the old one dropped and the new one renamed into its place. Indexes and
+-- triggers go with the old table, so they are recreated after.
+CREATE TABLE subject_grade_levels__new (
+    subject_id                   INTEGER NOT NULL,
+    grade_level_id               INTEGER NOT NULL,
+    created_at                   TEXT NOT NULL DEFAULT (now()),
+    PRIMARY KEY (subject_id, grade_level_id),
+    CONSTRAINT fk_sgl_grade FOREIGN KEY (grade_level_id) REFERENCES grade_levels (grade_level_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_sgl_subject FOREIGN KEY (subject_id) REFERENCES subjects (subject_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+INSERT INTO subject_grade_levels__new (subject_id, grade_level_id, created_at)
+    SELECT subject_id, grade_level_id, created_at FROM subject_grade_levels;
+DROP TABLE subject_grade_levels;
+ALTER TABLE subject_grade_levels__new RENAME TO subject_grade_levels;
+CREATE INDEX idx_sgl_grade ON subject_grade_levels (grade_level_id);
 
 -- ------------------------------------------------------------ demo sections
 -- The ids, copied out of sections so that nothing below has to read from it.
 
-CREATE TEMPORARY TABLE IF NOT EXISTS tmp_demo_sections (
-    section_id INT UNSIGNED NOT NULL PRIMARY KEY
-) ENGINE = MEMORY;
+CREATE TEMP TABLE IF NOT EXISTS tmp_demo_sections (
+    section_id INTEGER NOT NULL PRIMARY KEY
+);
 
-TRUNCATE TABLE tmp_demo_sections;
+DELETE FROM tmp_demo_sections;
 
 INSERT INTO tmp_demo_sections (section_id)
 SELECT section_id FROM sections WHERE section_code IN ('G7-S1','G7-S2');
@@ -52,20 +73,20 @@ SELECT section_id FROM sections WHERE section_code IN ('G7-S1','G7-S2');
 -- Students first: archiveSection() refuses while any are enrolled, and this
 -- follows the same order the interface would force.
 
-UPDATE students st
-  JOIN tmp_demo_sections d ON d.section_id = st.section_id
-   SET st.status = 'inactive', st.deleted_at = NOW(), st.updated_at = NOW()
- WHERE st.deleted_at IS NULL;
+UPDATE students
+   SET status = 'inactive', deleted_at = NOW(), updated_at = NOW()
+ WHERE section_id IN (SELECT section_id FROM tmp_demo_sections)
+   AND deleted_at IS NULL;
 
-UPDATE schedules sch
-  JOIN tmp_demo_sections d ON d.section_id = sch.section_id
-   SET sch.status = 'archived', sch.deleted_at = NOW(), sch.updated_at = NOW()
- WHERE sch.status = 'active'
-   AND sch.deleted_at IS NULL;
+UPDATE schedules
+   SET status = 'archived', deleted_at = NOW(), updated_at = NOW()
+ WHERE section_id IN (SELECT section_id FROM tmp_demo_sections)
+   AND status = 'active'
+   AND deleted_at IS NULL;
 
 UPDATE sections
    SET status = 'archived', deleted_at = NOW(), updated_at = NOW()
  WHERE section_code IN ('G7-S1','G7-S2')
    AND deleted_at IS NULL;
 
-DROP TEMPORARY TABLE IF EXISTS tmp_demo_sections;
+DROP TABLE IF EXISTS temp.tmp_demo_sections;

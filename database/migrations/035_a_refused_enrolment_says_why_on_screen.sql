@@ -31,10 +31,7 @@
 -- name yet without the enrolment failing to record at all.
 -- ---------------------------------------------------------------------------
 
-ALTER TABLE fingerprint_enrollment_requests
-  ADD COLUMN IF NOT EXISTS failure_code VARCHAR(40) NULL
-    COMMENT 'Machine-readable reason a request ended in failed; NULL for older rows'
-    AFTER message;
+ALTER TABLE fingerprint_enrollment_requests ADD COLUMN failure_code TEXT COLLATE NOCASE;  -- Machine-readable reason a request ended in failed; NULL for older rows
 
 -- Backfill the one case that is unambiguous from the text already stored. The
 -- sentence is generated in exactly one place (FingerprintEnrollmentService::
@@ -45,3 +42,4 @@ UPDATE fingerprint_enrollment_requests
  WHERE status = 'failed'
    AND failure_code IS NULL
    AND message LIKE 'This fingerprint is already enrolled to %';
+

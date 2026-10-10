@@ -18,13 +18,9 @@
 -- one column, without a role that then means nothing.
 -- ===========================================================================
 
-SET NAMES utf8mb4;
 
-ALTER TABLE devices
-  ADD COLUMN enrollment_station TINYINT(1) NOT NULL DEFAULT 0
-    COMMENT 'Desk-side scanner used for enrolment only; takes no classroom and records no attendance'
-    AFTER device_role;
+ALTER TABLE devices ADD COLUMN enrollment_station INTEGER NOT NULL DEFAULT 0;  -- Desk-side scanner used for enrolment only; takes no classroom and records no attendance
 
 -- Enrolment pickers list stations first, and there are only ever a handful.
-ALTER TABLE devices
-  ADD KEY idx_device_enrollment_station (enrollment_station, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_device_enrollment_station ON devices (enrollment_station, deleted_at);
+

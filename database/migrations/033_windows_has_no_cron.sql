@@ -14,3 +14,4 @@
 UPDATE settings
    SET description = 'Needs the background worker running - run install-worker.bat once, or keep worker.bat open.'
  WHERE setting_key = 'backup.schedule_time';
+
