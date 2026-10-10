@@ -160,7 +160,17 @@ switch ($command) {
         }
 
         try {
-            App\Core\Database::instance()->scalar('SELECT COUNT(*) FROM schema_migrations');
+            $db = App\Core\Database::instance();
+
+            // A file with no tables at all is a database that was never
+            // built — an empty file left by an interrupted first run, say —
+            // not a broken one. It is treated as "nothing here yet".
+            if ((int) $db->scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'") === 0) {
+                fwrite(STDERR, 'The database file is empty: ' . $path . PHP_EOL);
+                exit(3);
+            }
+
+            $db->scalar('SELECT COUNT(*) FROM schema_migrations');
             exit(0);
         } catch (Throwable $e) {
             // STDERR rather than STDOUT: start.bat sends both to nul and

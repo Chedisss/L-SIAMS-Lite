@@ -25,6 +25,9 @@ final class Database
 {
     private static ?Database $instance = null;
 
+    /** Whether opening the database may create the file. See allowCreating(). */
+    private static bool $mayCreate = false;
+
     private ?PDO $pdo = null;
     /** @var array<string,mixed> */
     private array $config;
@@ -54,6 +57,21 @@ final class Database
         self::$instance = null;
     }
 
+    /**
+     * Let this process create the database file if it does not exist.
+     *
+     * Off by default, because SQLite will otherwise create an empty file the
+     * moment anything opens a path that is not there — a page load, a health
+     * check, key:generate looking for data it might orphan — and an empty file
+     * then passes for a database with nothing in it. Only the commands whose
+     * job is to make a database (migrate, install, the importers) switch this
+     * on; for everything else a missing file is reported as missing.
+     */
+    public static function allowCreating(): void
+    {
+        self::$mayCreate = true;
+    }
+
     public function pdo(): PDO
     {
         if ($this->pdo instanceof PDO) {
@@ -69,12 +87,15 @@ final class Database
             // pdo_sqlite reads this as the busy timeout, in seconds. The
             // PRAGMA below sets the same thing to the millisecond.
             PDO::ATTR_TIMEOUT            => max(1, intdiv($this->busyTimeoutMs(), 1000)),
+            // Without CREATE, a missing file fails with SQLITE_CANTOPEN
+            // instead of quietly becoming an empty database.
+            PDO::SQLITE_ATTR_OPEN_FLAGS  => PDO::SQLITE_OPEN_READWRITE | (self::$mayCreate ? PDO::SQLITE_OPEN_CREATE : 0),
         ];
 
         try {
             $directory = dirname($path);
 
-            if (!is_dir($directory) && !@mkdir($directory, 0775, true) && !is_dir($directory)) {
+            if (self::$mayCreate && !is_dir($directory) && !@mkdir($directory, 0775, true) && !is_dir($directory)) {
                 throw new RuntimeException('The database folder could not be created: ' . $directory);
             }
 

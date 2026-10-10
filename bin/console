@@ -53,6 +53,13 @@ $command   = $argv[1] ?? 'help';
 $arguments = array_slice($argv, 2);
 $flags     = array_values(array_filter($arguments, static fn (string $a): bool => str_starts_with($a, '--')));
 
+// The commands whose job is to make a database may create its file; nothing
+// else may, so a missing database is reported rather than replaced by an
+// empty one (see Database::allowCreating()).
+if (in_array($command, ['migrate', 'migrate:fresh', 'install', 'db:import', 'db:import-mysql', 'schema:dump'], true)) {
+    Database::allowCreating();
+}
+
 function out(string $message = '', string $colour = ''): void
 {
     $colours = [
