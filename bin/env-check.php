@@ -54,6 +54,17 @@ switch ($command) {
             static fn (string $extension): bool => !extension_loaded($extension)
         ));
 
+        // The SQLite inside pdo_sqlite has to be new enough for the schema's
+        // generated columns (3.31). Any PHP 8.1 build is; checked anyway, so
+        // an unusual build says so here instead of failing in a migration.
+        if ($command === 'required' && $missing === []) {
+            $version = (string) (new PDO('sqlite::memory:'))->query('SELECT sqlite_version()')->fetchColumn();
+
+            if (version_compare($version, '3.31.0', '<')) {
+                $missing[] = 'SQLite 3.31+ (PHP has ' . $version . ')';
+            }
+        }
+
         if ($missing !== []) {
             echo implode(' ', $missing), PHP_EOL;
             exit(1);

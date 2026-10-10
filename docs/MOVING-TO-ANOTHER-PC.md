@@ -7,7 +7,7 @@ ways that look like unrelated hardware faults.
 | What | Where it lives | Carried by `git` or `update.bat`? |
 |---|---|---|
 | The code | the project folder | **yes** |
-| The database | MySQL, inside XAMPP | no |
+| The database | `storage\database\lsiams.sqlite`, in the project folder | no — never tracked |
 | The keys | `.env` in the project folder | **no** — deliberately |
 
 `.env` is deliberately not in version control, because it holds secrets. That
@@ -49,39 +49,48 @@ so plainly if the key no longer fits.
 Do this when the old PC still works and you want the teachers, students,
 sections, schedules, cards and fingerprints to come across.
 
+> **The short way.** The database is a file inside the project folder, so with
+> L-SIAMS stopped (`stop.bat`) you can copy the **whole project folder** — it
+> carries the code, `.env`, the photos and `storage\database` together — and
+> on the new PC just run `start.bat`. The steps below do the same thing one
+> piece at a time, through an encrypted backup.
+
 ### On the old PC
 
 1. **Back up the database.**
    ```
    php bin\console backup
    ```
-   The file lands in `storage/backups`. It is encrypted with `APP_KEY`, so it
+   The file lands in `database\backups`. It is encrypted with `APP_KEY`, so it
    is useless on its own — which is the point of step 2.
 
 2. **Copy `.env`.** Onto a USB stick, or anywhere you can reach from the new
    machine. This is the step people skip.
 
-3. **Copy `storage/uploads`** if you want the student and teacher photos.
+3. **Copy `public\uploads`** if you want the student and teacher photos.
 
 ### On the new PC
 
-4. **Install XAMPP**, start Apache and MySQL, and get the project folder in
+4. **Install XAMPP** (only its PHP is needed) and get the project folder in
    place — clone it, or unzip it and run `update.bat` once to link it.
 
 5. **Put the old `.env` in the project folder.** Do **not** run
    `key:generate`. If you already have, replace the whole file with the old
    one; the keys must match the data exactly.
 
-6. **Update the addresses in `.env`** if the new PC differs — database
-   credentials, and `APP_URL` if you set one. Leave every `*_KEY`, `*_SECRET`
-   and `*_PEPPER` line untouched.
+6. **Update the addresses in `.env`** if the new PC differs — `APP_URL` if you
+   set one, and `DB_PATH` only if you moved the database out of the folder.
+   Leave every `*_KEY`, `*_SECRET` and `*_PEPPER` line untouched.
 
 7. **Restore the database.**
    ```
-   php bin\console backup:decrypt storage\backups\<file>.sql.gz.lsiams
-   php bin\console db:import <the .sql it produced> --fresh
+   php bin\console db:import database\backups\<file>.sql.gz.lsiams --force
    php bin\console migrate
    ```
+   `db:import` decrypts the archive itself, and replaces the database in one
+   transaction — if anything fails, nothing changes. (Moving from the
+   **MariaDB** version instead? Use `import-from-mariadb.bat`; see
+   [MIGRATING-FROM-MARIADB.md](MIGRATING-FROM-MARIADB.md).)
 
 8. **Check it landed.**
    ```

@@ -19,13 +19,11 @@ Download it from <https://www.apachefriends.org> and install it. Take the
 defaults; installing to `C:\xampp` is easiest because the scripts look there
 first.
 
-XAMPP gives you three things this system uses:
-
-| | |
-|---|---|
-| **PHP** | the language the system is written in |
-| **MariaDB** | the database (XAMPP's Control Panel labels the button "MySQL" — same thing) |
-| **phpMyAdmin** | a web page for looking inside the database |
+This system uses one thing from XAMPP: **PHP**, the language it is written in.
+The database is not a separate program — it is a single file,
+`storage\database\lsiams.sqlite`, inside the project folder — so XAMPP's MySQL
+can stay off. (If you are moving over from the MariaDB version of L-SIAMS, see
+[MIGRATING-FROM-MARIADB.md](MIGRATING-FROM-MARIADB.md) first.)
 
 You do **not** need Apache for this guide. `start.bat` runs its own small web
 server, so there is no XAMPP configuration to do.
@@ -42,15 +40,9 @@ accident.
 
 ## First run — about five minutes
 
-### Step 1 — Start the database
+### Step 1 — Nothing to start
 
-Open the **XAMPP Control Panel**. Next to **MySQL**, click **Start**.
-
-Wait until the MySQL row turns green. That is the only thing you need running.
-
-> If MySQL will not start, something else on your PC is already using port 3306
-> — often a separately installed MySQL. Stop that service, or change the port in
-> XAMPP and put the same port in the `.env` file (created in the next step).
+There is no database server. Go straight to step 2.
 
 ### Step 2 — Double-click `start.bat`
 
@@ -60,8 +52,9 @@ walks through the setup. You will see it:
 1. find PHP and check the version and extensions
 2. create the `.env` configuration file
 3. generate the cryptographic keys
-4. create the `lsiams_db` database
-5. apply the database schema (7 migrations)
+4. see there is no database yet and ask whether to **import** one from the
+   MariaDB version or start a **new** one — press **N** for a new installation
+5. create `storage\database\lsiams.sqlite` and apply the schema (36 migrations)
 6. load the reference data — roles, permissions, grade levels, departments
 
 Then it stops and asks you to create your administrator account.
@@ -147,14 +140,11 @@ narrower than the administrator's.
 
 ## Every day after that
 
-1. **XAMPP Control Panel → Start MySQL**
-2. **Double-click `start.bat`**
-
-That is all. It skips the whole setup because `.env` already exists, and goes
+**Double-click `start.bat`.** That is all. It skips the whole setup because `.env` already exists, and goes
 straight to starting the system.
 
-To stop: **double-click `stop.bat`**, or just close the three windows. MySQL
-keeps running until you stop it in the Control Panel.
+To stop: **double-click `stop.bat`**, or just close the three windows. There is
+nothing else running.
 
 ---
 
@@ -179,11 +169,11 @@ Next through every screen, the defaults are all correct. Also a one-time thing.
 
 | Safe | Why |
 |---|---|
-| `.env` | your keys and database password are not in the repository |
+| `.env` | your keys are not in the repository |
 | `public/uploads/` | student and teacher photos |
 | `storage/reports/`, `storage/logs/` | generated reports and logs |
 | `database/backups/` | your backups |
-| The database itself | it lives in MySQL, not in this folder |
+| `storage/database/` | the database file itself — never tracked, never replaced |
 
 **What is replaced:** the program files. If you edited any of them yourself,
 your edit is replaced by the official version — so keep your own changes
@@ -217,8 +207,8 @@ Open a Command Prompt in the project folder (Shift + right-click the folder →
 | Command | What it does |
 |---|---|
 | `console.bat doctor` | check the whole installation and list what is wrong |
-| `mysql-doctor.bat` | double-click it when MySQL will not stay started |
-| `import.bat` | drag a `.sql` file onto it to load it into the database |
+| `import-from-mariadb.bat` | bring data over from the MariaDB version (drop a backup or export on it if MySQL will not start) |
+| `import.bat` | drag a `.sql` file or backup onto it to load it into the database |
 | `console.bat seed --demo` | fill the system with sample data |
 | `console.bat user:create-admin` | add another administrator |
 | `console.bat backup` | take an encrypted backup right now |
@@ -228,41 +218,23 @@ Open a Command Prompt in the project folder (Shift + right-click the folder →
 
 ---
 
-## Restoring a `.sql` file — yours or phpMyAdmin's
+## Restoring a `.sql` file
 
-phpMyAdmin will not reliably re-import its own exports. It writes the tables in
-alphabetical order and adds every foreign key at the end, so a table can refer
-to one that does not exist yet; and it leaves the constraint checks switched
-on while it does it. The import stops part-way with a message that names an
-error number and nothing you can act on. Common ones:
+Drag the file onto **`import.bat`**. It works out what kind of file it is:
 
-| What phpMyAdmin says | What it means |
-|---|---|
-| `#1451` / `#1452` / `errno: 150` | a foreign key pointed at a table that had not been created yet |
-| `#1046 - No database selected` | the file has no `USE` line and no database was open |
-| `#1050 - Table already exists` | the tables were already there; the file cannot add them twice |
-| a syntax error on the last line | the text was truncated — usually pasted into the SQL box rather than uploaded |
+- **A SQLite dump** — what `console.bat backup:decrypt` writes. It replaces the
+  database as **one transaction**: either the whole file goes in, or nothing
+  changes. If the database already holds data you are asked to confirm with
+  `--force`:
 
-**Import it this way instead.** Drag the `.sql` file onto **`import.bat`**, or
-from a Command Prompt in the project folder:
+  ```
+  console.bat db:import "C:\path\to\file.sql" --force
+  ```
 
-```
-console.bat db:import "C:\Users\You\Downloads\lsiams_db.sql"
-```
-
-That switches the constraint checks off for the duration, ignores any
-`CREATE DATABASE` / `USE` lines in the file so it always lands in the database
-named in `.env`, and if a statement really is bad it prints the statement
-rather than an error number.
-
-To replace what is already there rather than adding to it:
-
-```
-console.bat db:import "C:\path\to\file.sql" --fresh
-```
-
-`--fresh` drops every existing table first. There is no undo — take a backup
-with `console.bat backup` if the current data still matters.
+- **A file from the MariaDB version** — a phpMyAdmin export, a mysqldump, or a
+  `.sql.gz.lsiams` backup taken before the move. It is handed to the MariaDB
+  importer, which rebuilds it into SQLite and checks every table. See
+  [MIGRATING-FROM-MARIADB.md](MIGRATING-FROM-MARIADB.md).
 
 ### Restoring a `.sql.gz.lsiams` backup
 
@@ -282,8 +254,11 @@ you can go straight at the file:
 
 ```
 console.bat backup:decrypt lsiams-manual-20260814-120753.sql.gz.lsiams
-console.bat db:import database\backups\lsiams-manual-20260814-120753.sql
+console.bat db:import database\backups\lsiams-manual-20260814-120753.sql --force
 ```
+
+(A `.sql.gz.lsiams` taken by the **MariaDB** version is imported differently:
+drop it onto `import-from-mariadb.bat`.)
 
 Delete the decrypted `.sql` afterwards — it is plaintext school data.
 
@@ -354,7 +329,7 @@ window was closed; run `start.bat` again, or `console.bat doctor` to confirm.
 a transport. "Reconnecting" means a connection that was working has dropped.
 
 **"PHP is missing: ..." and it refuses to start**
-Only four extensions are genuinely required — `pdo_mysql`, `openssl`,
+Only four extensions are genuinely required — `pdo_sqlite`, `openssl`,
 `mbstring` and `json`. Open `C:\xampp\php\php.ini` in Notepad, press Ctrl+F,
 find each name it listed, and delete the `;` at the start of that line:
 
@@ -381,21 +356,13 @@ nothing enabled runs every one of those features.
 XAMPP is not installed, or not on `C:`, `D:` or `E:`. Install it, or add
 `C:\xampp\php` to your PATH.
 
-**MySQL goes green then immediately red in the XAMPP Control Panel**
-Double-click **`mysql-doctor.bat`**. It checks whether another MySQL already
-holds port 3306 — the usual cause — and then runs MySQL in the window, where
-the error can be seen. A process that dies this early often never manages to
-write anything to `mysql_error.log`, which is why that file ends mid-startup
-with no error in it.
-
-Your data is in `C:\xampp\mysql\data\lsiams_db`. Copy that folder somewhere
-safe before any fix that touches the data directory, and never delete
-`ibdata1` — it holds every InnoDB table you have.
-
-**"Cannot connect to MySQL"**
-MySQL is not started. XAMPP Control Panel → Start next to MySQL. If it is green
-and this still happens, check `DB_USER` and `DB_PASS` in the `.env` file —
-XAMPP's default is user `root` with an empty password.
+**"The database file would not open"**
+`storage\database\lsiams.sqlite` is read-only, was damaged in a copy, or is
+not a database at all. Run `console.bat doctor`, which checks the file in
+detail. To go back to a known-good state, restore a backup from the Backups
+page or with `import.bat`. Copy the database only while L-SIAMS is stopped
+(`stop.bat`): a copy taken while it runs can miss the latest writes, which sit
+in the `lsiams.sqlite-wal` file beside it until they are folded in.
 
 **The browser says "can't reach this page"**
 The web window closed. Look for an error in it, then run `start.bat` again.
@@ -423,7 +390,10 @@ to read the old one — passwords are stored as bcrypt hashes, which is the poin
 
 Useful for a defence panel:
 
-- **PHP** serves the web application; **MariaDB** stores the data.
+- **PHP** serves the web application; **SQLite** stores the data in a single
+  file. Several terminals can write at once: each write takes SQLite's write
+  lock for a few milliseconds and the others wait their turn, and the database
+  itself enforces that attendance can never be recorded twice or deleted.
 - `start.bat` runs three processes: the **web server**, a **maintenance worker**
   that closes abandoned sessions and tidies old data, and a **realtime server**
   that pushes live updates to open dashboards.
@@ -449,5 +419,5 @@ own PC — they are each labelled in `.env.local.example`:
 | Server-Sent Events off | one open stream blocks the single-threaded dev server | on a real server this is the fastest live-update path |
 
 For an actual classroom installation — Apache or nginx, HTTPS, the worker and
-realtime server running as services, database privileges locked down and
+realtime server running as services, the database folder locked down and
 backups going off the machine — follow [DEPLOYMENT.md](DEPLOYMENT.md) instead.

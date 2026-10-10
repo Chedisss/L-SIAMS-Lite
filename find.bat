@@ -185,7 +185,7 @@ if exist "%BASE%\.env" if exist "%CD%\.env" (
     if errorlevel 1 (
         echo   [!] Your .env is DIFFERENT from the remembered one.
         echo       These database lines are set right now:
-        findstr /B /I /C:"DB_HOST" /C:"DB_PORT" /C:"DB_NAME" /C:"DB_USER" "%CD%\.env"
+        findstr /B /I /C:"DB_PATH" /C:"DB_BUSY_TIMEOUT_MS" "%CD%\.env"
         echo       ^(remembered .env is in .lsiams_baseline\.env if you want to compare^)
     )
 )
@@ -352,7 +352,7 @@ echo       find.bat
 echo         - checks every PHP file for syntax errors (bugs), with file+line
 echo         - compares all code to the remembered copy: CHANGED / DELETED / NEW
 echo         - tests the database connection and prints the real reason if it
-echo           fails (wrong DB_HOST/PORT/NAME/USER/PASS in .env, MySQL stopped)
+echo           fails (database file missing, moved, read-only or damaged)
 echo.
 echo   STEP 3 (fix it):
 echo       Fix by hand using the file+line shown, then run find.bat again, OR

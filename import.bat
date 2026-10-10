@@ -1,13 +1,16 @@
 @echo off
 REM ===========================================================================
-REM  L-SIAMS - import a .sql file into the database
+REM  L-SIAMS - load a database file
 REM
-REM  Drag a .sql file onto this icon, or double-click it and type the path
-REM  when asked. Works with phpMyAdmin exports.
+REM  Drag a file onto this icon, or double-click it and type the path when
+REM  asked. It works out what the file is:
 REM
-REM  The file lands in the database named in .env, whatever the file itself
-REM  says, and foreign key checks are switched off while it runs - so the
-REM  order the tables appear in does not matter.
+REM    - a phpMyAdmin export, a mysqldump, or a backup from the MariaDB version
+REM      of L-SIAMS: imported with import-from-mariadb.bat's checks;
+REM    - a SQLite .sql dump (what console.bat backup:decrypt writes): replaces
+REM      the database, as one transaction.
+REM
+REM  Either way, a failure changes nothing.
 REM ===========================================================================
 
 setlocal enabledelayedexpansion
@@ -60,14 +63,17 @@ echo.
 echo   Importing !SQLFILE!
 echo.
 
-REM --fresh would drop the existing tables first. It is deliberately not passed
-REM here: dragging a file onto an icon should never destroy data by surprise.
-REM Run  console.bat db:import "path\to\file.sql" --fresh  to replace instead.
+REM db:import opens backups and .gz files itself and recognises a file from
+REM the MariaDB version by its contents, handing it to the MariaDB importer.
+REM --force is deliberately not passed: dropping a file onto an icon should
+REM never replace a database that holds data by surprise.
 "%PHP%" bin\console db:import "!SQLFILE!"
 
 if errorlevel 1 (
     echo.
-    echo   The import stopped. The failing statement is printed above.
+    echo   The import stopped and nothing was changed. The reason is above.
+    echo   To replace a database that already holds data, run:
+    echo     console.bat db:import "!SQLFILE!" --force
     pause
     exit /b 1
 )

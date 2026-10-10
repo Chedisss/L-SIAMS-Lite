@@ -38,21 +38,20 @@ replaces only one of them:
 | The site | `start.bat` (PHP's built-in server) | **Apache**, from the XAMPP Control Panel |
 | The worker | `start.bat` | `start.bat` — unchanged |
 | Live dashboards | `start.bat` | `start.bat` — unchanged |
-| The database | XAMPP Control Panel | XAMPP Control Panel — unchanged |
+| The database | a file, nothing to start | a file, nothing to start — unchanged |
 
-So the daily routine becomes **three clicks instead of two**:
+So the daily routine becomes **two clicks instead of one**:
 
-1. XAMPP Control Panel → **Start MySQL**
-2. XAMPP Control Panel → **Start Apache**
-3. Double-click **`start.bat`**
+1. XAMPP Control Panel → **Start Apache**
+2. Double-click **`start.bat`**
 
 `start.bat` notices that `.env` says `https://`, skips its own web server —
 which cannot do TLS and would otherwise put a second, unencrypted copy of the
 whole system on port 8080 — and starts just the worker and the realtime server.
 It says so when it does, and opens the browser at the right address.
 
-`stop.bat` still closes the worker and the realtime server. Apache and MySQL are
-stopped from the Control Panel.
+`stop.bat` still closes the worker and the realtime server. Apache is stopped
+from the Control Panel.
 
 > **The worker is not optional.** It closes expired attendance sessions, marks
 > devices offline and runs retention. A school that only starts Apache gets a
@@ -477,6 +476,8 @@ Worth being clear, so nobody assumes more than is true.
 - The database itself is not encrypted by this. Passwords are bcrypt hashes,
   terminal secrets and fingerprint templates are encrypted under `APP_KEY`, and
   backups are encrypted — but student names and attendance records sit in
-  MariaDB in the clear, as they must for the system to query them.
+  the SQLite file in the clear, as they must for the system to query them —
+  which is why `storage\database` should be readable only by the account that
+  runs L-SIAMS.
 - HTTPS does not stop a person who is logged in from doing anything they are
   allowed to do. That is what roles, permissions and the audit log are for.

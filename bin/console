@@ -875,6 +875,10 @@ function commandDoctor(): void
         return;
     }
 
+    // Generated columns, which the schema relies on, arrived in SQLite 3.31.
+    $sqliteVersion = (string) $db->scalar('SELECT sqlite_version()');
+    $check(version_compare($sqliteVersion, '3.31.0', '>='), 'SQLite 3.31 or newer', $sqliteVersion);
+
     $writable = is_writable($databasePath) && is_writable(dirname($databasePath));
     $check($writable, 'Database file and folder writable',
         $writable ? '' : 'SQLite writes its -wal and -shm files beside the database');
@@ -1337,7 +1341,7 @@ function commandDoctor(): void
         // that is working and ignore the one that is not.
         if ($isHttps) {
             $note('This installation serves over HTTPS, which means Apache serves it:');
-            $note('  1. Open the XAMPP Control Panel and Start Apache (and MySQL).');
+            $note('  1. Open the XAMPP Control Panel and Start Apache.');
             $note('  2. If Apache will not stay started, open its Logs -> Apache');
             $note('     (error.log) button. Port ' . $webPort . ' already in use is the usual');
             $note('     cause, normally XAMPP\'s own httpd-ssl.conf still being included.');
@@ -1353,8 +1357,8 @@ function commandDoctor(): void
             $note('open while the system is in use.');
             $note('');
             $note('XAMPP\'s Apache does NOT serve L-SIAMS, so Apache showing green on ports');
-            $note('80 and 443 in the XAMPP Control Panel does not mean the site is up. Only');
-            $note('MySQL is needed from XAMPP; start.bat provides the web server itself.');
+            $note('80 and 443 in the XAMPP Control Panel does not mean the site is up.');
+            $note('Nothing needs starting in XAMPP; start.bat provides the web server itself.');
         }
     }
 
@@ -2084,16 +2088,6 @@ function teacherUsername(string $first, string $last, array $reserved): string
 }
 
 /**
- * Write a single importable SQL file for people who install through
- * phpMyAdmin rather than a shell.
- *
- * The migrations remain the source of truth — this is a build artefact
- * regenerated from a freshly migrated and reference-seeded database, so it can
- * never describe a schema the migrations do not produce. It deliberately omits
- * user accounts and any student, teacher or attendance data: a schema file that
- * shipped a known login would be a backdoor in every installation that used it.
- */
-/**
  * Turn a .sql.gz.lsiams (or older .sql.gz.enc) backup archive into readable SQL.
  *
  * The admin Backups page can only restore archives it has a database row for,
@@ -2309,13 +2303,31 @@ function commandDbImport(array $arguments, array $flags): void
 
     $sql = (string) file_get_contents($path);
 
+    // A backup archive or a gzipped dump is opened here, so any of them can be
+    // dropped onto import.bat without decrypting it first.
+    try {
+        if (str_starts_with($sql, 'LSIAMSBK')) {
+            $sql = BackupService::decryptFile($path);
+        } elseif (str_starts_with($sql, "\x1f\x8b")) {
+            $sql = (string) gzdecode($sql);
+        }
+    } catch (Throwable $e) {
+        fail('The file could not be opened: ' . (($e instanceof App\Core\Exceptions\ValidationException) ? $e->firstMessage() : $e->getMessage())
+           . "\n  A backup only opens with the APP_KEY it was made under — the .env from that installation.");
+    }
+
     // An editor that saved it as UTF-8 with a byte order mark puts three junk
     // characters in front of the first statement.
     $sql = (string) preg_replace('/^\xEF\xBB\xBF/', '', $sql);
 
+    // SQL for the MariaDB version — a phpMyAdmin export, a mysqldump, a backup
+    // taken before the move — is rebuilt row by row by the MariaDB importer.
     if (BackupService::isMariaDbDump($sql)) {
-        fail("This file is from the MariaDB version (a phpMyAdmin export, mysqldump or old backup).\n"
-           . '  Import it with:  php bin/console db:import-mysql --from-file=' . escapeshellarg($path));
+        out('  This file is from the MariaDB version; importing it with db:import-mysql.', 'grey');
+        unset($sql);
+        commandDbImportMysql(['--from-file=' . $path], $flags);
+
+        return;
     }
 
     if (trim($sql) === '') {

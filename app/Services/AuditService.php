@@ -14,9 +14,9 @@ use Throwable;
  * normal UI").
  *
  * There is deliberately no update() or delete() method on this class, the table
- * carries BEFORE UPDATE / BEFORE DELETE triggers that raise SQLSTATE 45000, and
- * the application database user holds only INSERT and SELECT on it. Three
- * independent layers, because non-repudiation is the whole point.
+ * carries BEFORE UPDATE / BEFORE DELETE triggers that refuse the statement
+ * whoever sends it, and the database file is readable only by the account that
+ * runs L-SIAMS. Independent layers, because non-repudiation is the whole point.
  */
 final class AuditService
 {

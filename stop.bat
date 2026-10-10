@@ -2,8 +2,9 @@
 REM ===========================================================================
 REM  L-SIAMS — stop everything start.bat opened
 REM
-REM  Closes the web, worker and realtime windows. Your database keeps running:
-REM  stop MySQL from the XAMPP Control Panel if you want that off too.
+REM  Closes the web, worker and realtime windows. The database is a file in
+REM  this folder, so there is nothing else to stop; once these are closed it is
+REM  safe to copy or back up storage\database.
 REM ===========================================================================
 
 title L-SIAMS - stopping
@@ -23,7 +24,7 @@ for %%W in ("L-SIAMS web" "L-SIAMS worker" "L-SIAMS realtime") do (
 )
 
 echo.
-echo   Done. MySQL is still running - stop it from the XAMPP
-echo   Control Panel if you no longer need it.
+echo   Done. Nothing else needs stopping - the database is a file,
+echo   storage\database\lsiams.sqlite, and nothing has it open now.
 echo.
 timeout /t 3 /nobreak >nul

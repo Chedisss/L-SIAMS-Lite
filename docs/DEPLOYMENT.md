@@ -14,20 +14,20 @@ at runtime.
 # Debian / Ubuntu
 sudo apt update
 sudo apt install -y \
-    php8.4 php8.4-fpm php8.4-mysql php8.4-mbstring php8.4-zip \
+    php8.4 php8.4-fpm php8.4-sqlite3 php8.4-mbstring php8.4-zip \
     php8.4-gd php8.4-curl php8.4-xml php8.4-sockets \
-    mysql-server nginx
+    nginx
 
 # RHEL / Rocky
 sudo dnf install -y \
-    php php-fpm php-mysqlnd php-mbstring php-zip php-gd php-json php-sockets \
-    mysql-server nginx
+    php php-fpm php-pdo php-mbstring php-zip php-gd php-json php-sockets \
+    nginx
 ```
 
 Confirm every extension the application needs is loaded:
 
 ```bash
-php -m | grep -E '^(pdo_mysql|openssl|mbstring|zip|gd|json|zlib|sockets)$'
+php -m | grep -E '^(pdo_sqlite|openssl|mbstring|zip|gd|json|zlib|sockets)$'
 ```
 
 All eight must appear. `sockets` is used only by the realtime server; the rest
@@ -38,50 +38,11 @@ present and falls back to rejection sampling when it is not; both routes produce
 the same 59-character keys, and `php bin/console security:audit-keys` exercises
 whichever one this host takes.
 
-### MySQL or MariaDB
+### No database server
 
-Both are supported and the schema has been verified on each. One difference is
-worth knowing if you ever revisit the foreign keys: MariaDB refuses to build a
-generated column over a foreign-key child column that carries a write-back
-referential action (`ON UPDATE CASCADE`, `ON DELETE SET NULL`). Three of the
-system's uniqueness guarantees are generated columns over such columns, so those
-foreign keys use `RESTRICT` on both actions. Neither action was reachable anyway
-— the parents are AUTO_INCREMENT surrogate keys that are never updated, and rows
-are soft-deleted rather than removed — so nothing is lost, but changing them back
-to `CASCADE` would break `migrate` on MariaDB.
-
-### PHP configuration
-
-In `/etc/php/8.4/fpm/php.ini`:
-
-```ini
-; Uploads — student photo imports and CSV/XLSX imports.
-upload_max_filesize = 8M
-post_max_size       = 10M
-max_file_uploads    = 20
-
-; A 500-row import with a full transaction needs headroom, but not minutes.
-max_execution_time  = 120
-memory_limit        = 256M
-
-; The application sets its own cookie parameters; these are the backstop.
-session.cookie_httponly = 1
-session.cookie_secure   = 1
-session.cookie_samesite = Strict
-session.use_strict_mode = 1
-
-; Do not disclose the PHP version in response headers.
-expose_php = Off
-
-; Errors go to the log, never to the browser.
-display_errors     = Off
-log_errors         = On
-error_log          = /var/log/php/lsiams-error.log
-```
-
-Restart PHP-FPM afterwards: `sudo systemctl restart php8.4-fpm`.
-
----
+The database is one SQLite file, compiled into PHP's `pdo_sqlite`; there is no
+server package to install. It needs SQLite 3.31 or newer, which every PHP 8.1+
+build has — `php bin/console doctor` prints the version.
 
 ## 2. Files and permissions
 
@@ -91,11 +52,18 @@ cd /var/www/lsiams
 
 sudo chown -R www-data:www-data /var/www/lsiams
 
-# The application only needs to write to these three places.
+# The application only needs to write to these places. storage/ includes
+# storage/database, which holds the database file and SQLite's -wal and -shm
+# files beside it: the folder, not only the file, must be writable.
 sudo chmod -R 750 /var/www/lsiams
 sudo chmod -R 770 storage public/uploads database/backups
 
-# .env holds the database password and the master keys.
+# Nobody but the application's account may read or write the database: there
+# are no database accounts in SQLite, so the file's permissions are the
+# boundary between "can use the system" and "can rewrite its history".
+sudo chmod 700 storage/database
+
+# .env holds the master keys.
 sudo chmod 640 .env
 sudo chown root:www-data .env
 ```
@@ -108,193 +76,71 @@ document root at `public/` precisely so they cannot be.
 
 ## 3. Database
 
-### Create the schema and the application user
+### Create it
 
-```sql
-CREATE DATABASE lsiams_db
-  CHARACTER SET utf8mb4
-  COLLATE utf8mb4_unicode_ci;
-
-CREATE USER 'lsiams_app'@'localhost'
-  IDENTIFIED BY '<a long random password>';
-
-GRANT SELECT, INSERT, UPDATE, DELETE
-  ON lsiams_db.* TO 'lsiams_app'@'localhost';
-
-FLUSH PRIVILEGES;
+```bash
+sudo -u www-data php bin/console install    # migrate + seed + first administrator
 ```
 
-### Then withhold the write privileges from the immutable tables
+That creates `storage/database/lsiams.sqlite` (or wherever `DB_PATH` points)
+and applies every migration, each as one transaction. Run every console command
+as the web server's account (`www-data` here), so the files SQLite creates
+beside the database belong to it too; a `-wal` file owned by root is the classic
+reason for "attempt to write a readonly database".
 
-This is the third layer of the immutability guarantee, and the only one an
-attacker holding the application's own credentials cannot get around. Apply it
-**after** running the migrations, because migrations need DDL rights that this
-user must not keep.
+Coming from the MariaDB version of L-SIAMS, import instead of installing:
+`sudo -u www-data php bin/console db:import-mysql` (see
+[MIGRATING-FROM-MARIADB.md](MIGRATING-FROM-MARIADB.md)).
 
-> **This section used to say `REVOKE`, and that does not work.** MySQL and
-> MariaDB privileges are *cumulative*, not subtractive: there is no way to take
-> a privilege back at table level once it has been granted at database level.
-> Running `REVOKE DELETE ON lsiams_db.audit_logs FROM 'lsiams_app'@'localhost'`
-> against the grant above fails outright —
->
-> ```
-> ERROR 1147 (42000): There is no such grant defined for user 'lsiams_app'
-> on host 'localhost' on table 'audit_logs'
-> ```
->
-> — and the subtler trap is that granting a *narrower* set at table level does
-> not help either. `GRANT SELECT, INSERT ON lsiams_db.audit_logs` leaves the
-> database-level `UPDATE, DELETE` fully in force, while `SHOW GRANTS` prints a
-> line that reads as though the table were restricted. An installation that did
-> that would believe it had the third layer and would not have it.
->
-> The privilege has to be **never granted**, not granted and taken back. That is
-> what the rest of this section does.
+### How it is opened
 
-Replace the database-wide grant above with one that carries only what every
-table may safely have:
+Every connection sets the same four things (`app/Core/Database.php`):
 
-```sql
-GRANT SELECT, INSERT, SHOW VIEW ON lsiams_db.* TO 'lsiams_app'@'localhost';
+| | Why |
+|---|---|
+| `journal_mode = WAL` | readers — the dashboards, the realtime server, reports — never wait for a tap, and a tap never waits for them |
+| `synchronous = NORMAL` | the documented safe setting under WAL: a power cut can lose the last instant of commits but never corrupts the file |
+| `foreign_keys = ON` | SQLite ships with them off, per connection |
+| `busy_timeout` (`DB_BUSY_TIMEOUT_MS`, default 5000) | one connection writes at a time; the others wait up to this long instead of failing |
+
+Write transactions begin `IMMEDIATE`, taking the write lock at the start. That
+is what replaces the MariaDB version's `SELECT ... FOR UPDATE` row locks: a
+transaction that holds the only write lock cannot have the rows it read changed
+underneath it. A write that still finds the database busy after the timeout is
+retried with backoff (`deadlock_retry` in `config/database.php`).
+
+Keep the file on a **local disk**. SQLite's locking depends on the operating
+system's file locks, which network file systems (SMB shares, NFS) do not
+reliably provide.
+
+### Protecting history
+
+The audit log, security log and login history cannot be deleted, and attendance
+records cannot be deleted or re-attributed: the services have no method that
+would, and triggers in the database refuse the statement whoever sends it.
+
+There are no database accounts to withhold privileges from, so the layer the
+MariaDB version built with GRANTs is the file system here: only the account
+that runs L-SIAMS may open `storage/database`. Then prove the triggers are in
+place rather than assuming it:
+
+```bash
+sudo -u www-data php bin/console security:privileges
 ```
 
-> **`SHOW VIEW` is not optional, and it is not a write.** The backup dumps the
-> database's views with `SHOW CREATE VIEW`, which needs this privilege; without
-> it the nightly backup fails on the first view it reaches
-> (`1142 SHOW VIEW command denied … for table 'v_attendance_detail'`) and
-> nothing else misbehaves, so it is easy to leave out and only discover when a
-> restore is needed. It only reads view definitions, so it takes nothing away
-> from the immutability guarantee. `console.bat security:privileges` checks for
-> it explicitly.
+It attempts each forbidden change on a real row, inside a transaction that is
+always rolled back, and lists any guard that let it through. Run it after any
+restore.
 
-Then hand out `UPDATE` and `DELETE` table by table. Do not type this list —
-generate it, so that a table added by a future migration is picked up rather
-than silently left without the privileges the application needs:
+### Health
 
-```sql
--- Everything except the six no-delete tables gets both.
-SELECT CONCAT('GRANT UPDATE, DELETE ON `lsiams_db`.`', TABLE_NAME,
-              '` TO ''lsiams_app''@''localhost'';')
-  FROM information_schema.TABLES
- WHERE TABLE_SCHEMA = 'lsiams_db' AND TABLE_TYPE = 'BASE TABLE'
-   AND TABLE_NAME NOT IN ('audit_logs', 'login_history',
-                          'security_logs', 'attendance_records', 'rfid_logs',
-                          'fingerprint_logs', 'attendance_modifications')
-UNION ALL
--- Corrected in place but never deleted — see the notes below. security_logs
--- is here because an event is resolved and annotated; its content is frozen by
--- a trigger, not by withholding UPDATE.
-SELECT CONCAT('GRANT UPDATE ON `lsiams_db`.`', TABLE_NAME,
-              '` TO ''lsiams_app''@''localhost'';')
-  FROM information_schema.TABLES
- WHERE TABLE_SCHEMA = 'lsiams_db' AND TABLE_TYPE = 'BASE TABLE'
-   AND TABLE_NAME IN ('security_logs', 'attendance_records', 'rfid_logs',
-                      'fingerprint_logs', 'attendance_modifications');
+```bash
+sudo -u www-data php bin/console doctor
 ```
 
-Run that, copy the statements it prints, run those, then `FLUSH PRIVILEGES;`.
-
-`audit_logs` and `login_history` appear in neither list: they keep
-`SELECT, INSERT` from the database-wide grant and nothing else, which is exactly
-append-only. `security_logs` gets `UPDATE` so an administrator can resolve an
-event — but no `DELETE`, and `trg_security_immutable_content` (migration 036)
-rejects any update that changes the event itself, leaving only the resolution
-status and note free to move.
-
-**Re-run the generator after every upgrade that adds a table.** A new table
-inherits `SELECT, INSERT` automatically and nothing more, so the symptom is an
-"UPDATE command denied" error in the log rather than a silent security hole —
-but it is still an outage.
-
-### Then prove it, rather than assuming it
-
-```
-console.bat security:privileges
-```
-
-Connects as the application's own database user, reads its effective grants and
-reports, table by table, whether each protected write is genuinely refused. Run
-it after any restore from a full dump: a dump reinstates the grants that were in
-place when it was taken, and this is the only layer of the three that a restore
-can quietly undo.
-
-> **Do not revoke UPDATE on `attendance_records`.** Unlike the log tables, an
-> attendance row is legitimately written twice: the tap-in creates it, and the
-> tap-out writes `time_out`, `duration_minutes`, `departure_status` and
-> `final_status` onto the same row. Session close does the same for automatic
-> time-outs, and an administrator correction may amend times and statuses.
-> Revoking UPDATE here would break tap-out entirely.
->
-> What protects the row instead is the `trg_attendance_immutable_identity`
-> trigger, which rejects any UPDATE that changes the student, session, section,
-> grade level, subject, teacher, classroom, card UID, request id or creation
-> time. The mutable surface is deliberately narrow: times and statuses, nothing
-> else. A row can be corrected; it can never become somebody else's.
->
-> Every correction is additionally recorded in `attendance_modifications` with
-> the administrator, the field, the old and new values and a mandatory reason —
-> a second trigger rejects a blank one.
-
-Run the migrations as a separate, more privileged user:
-
-```sql
-CREATE USER 'lsiams_migrate'@'localhost' IDENTIFIED BY '<another long password>';
-GRANT ALL PRIVILEGES ON lsiams_db.* TO 'lsiams_migrate'@'localhost';
-GRANT SUPER ON *.* TO 'lsiams_migrate'@'localhost';   -- needed to create triggers
-FLUSH PRIVILEGES;
-```
-
-Put `lsiams_migrate` in `.env` while installing, then switch `.env` back to
-`lsiams_app` before the system goes live, and drop or lock the migrate user until
-the next upgrade.
-
-### MySQL tuning
-
-In `/etc/mysql/mysql.conf.d/lsiams.cnf`:
-
-```ini
-[mysqld]
-# --- correctness -----------------------------------------------------------
-# The application relies on READ COMMITTED plus explicit row locks. REPEATABLE
-# READ would hold gap locks that turn concurrent taps on adjacent students into
-# avoidable lock waits.
-transaction_isolation = READ-COMMITTED
-
-# Every write must survive a power cut. A school's mains supply is not a data
-# centre's, and losing the last few taps is not acceptable.
-innodb_flush_log_at_trx_commit = 1
-sync_binlog                    = 1
-
-# Reject silently-truncating writes rather than storing something wrong.
-sql_mode = STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
-
-# --- sizing (assumes 4 GB RAM; scale to ~60% of RAM on a larger box) --------
-innodb_buffer_pool_size = 2G
-innodb_log_file_size    = 512M
-innodb_flush_method     = O_DIRECT
-
-# --- concurrency -----------------------------------------------------------
-# Taps hold row locks for milliseconds. A wait longer than a few seconds means
-# something is genuinely stuck, and failing fast is better than a pile-up.
-innodb_lock_wait_timeout = 5
-max_connections          = 200
-
-# --- character set ---------------------------------------------------------
-character_set_server = utf8mb4
-collation_server     = utf8mb4_unicode_ci
-
-# --- logging ---------------------------------------------------------------
-slow_query_log      = 1
-slow_query_log_file = /var/log/mysql/lsiams-slow.log
-long_query_time     = 1
-```
-
-`innodb_lock_wait_timeout = 5` matters. The application retries deadlocks
-(1213) and lock-wait timeouts (1205) with 50 / 150 / 400 ms backoff; a long
-server-side timeout would make a stuck transaction hold up a queue of taps for
-50 seconds before the retry logic ever sees it.
-
----
+checks the file opens, is writable, is in WAL mode with foreign keys on, passes
+SQLite's `quick_check`, and has every migration applied; it also lists any
+rows whose parent row is missing.
 
 ## 4. Web server
 
@@ -485,8 +331,7 @@ place rather than retyped. They are reproduced here for reference.
 ```ini
 [Unit]
 Description=L-SIAMS maintenance worker
-After=network.target mysql.service
-Requires=mysql.service
+After=network.target
 
 [Service]
 Type=simple
@@ -516,8 +361,7 @@ WantedBy=multi-user.target
 ```ini
 [Unit]
 Description=L-SIAMS realtime WebSocket server
-After=network.target mysql.service
-Requires=mysql.service
+After=network.target
 
 [Service]
 Type=simple
@@ -605,6 +449,10 @@ Nightly, via cron for `www-data`:
 15 1 * * * cd /var/www/lsiams && /usr/bin/php bin/console backup >> /var/log/lsiams/backup.log 2>&1
 ```
 
+A backup is taken while the system runs: it reads one consistent moment through
+a read transaction and holds up no terminal. Restoring replaces the database in
+a single transaction, so a restore that fails part-way changes nothing.
+
 Then copy the encrypted files off the machine — a backup on the same disk as the
 database is not a backup:
 
@@ -640,8 +488,8 @@ phrase, and signs every session out when it completes.
 - [ ] `APP_ENV=production` and `APP_DEBUG=false` in `.env`
 - [ ] `APP_KEY`, `API_KEY_PEPPER` and `REALTIME_TICKET_SECRET` generated, not left blank
 - [ ] `.env` is `chmod 640`, owned `root:www-data`
-- [ ] `.env` points at `lsiams_app`, not `lsiams_migrate`
-- [ ] The immutability REVOKEs have been applied
+- [ ] `storage/database` is `chmod 700`, owned by the web server's account
+- [ ] `php bin/console security:privileges` reports every guard holding
 - [ ] TLS certificate installed; HTTP redirects to HTTPS
 - [ ] The internal CA root is installed on every terminal
 - [ ] `TRUSTED_WEB_CIDRS` and `TRUSTED_DEVICE_CIDRS` reflect the real network
@@ -664,10 +512,8 @@ php bin/console backup                     # before anything else
 
 git pull
 
-# Migrations need DDL rights — switch DB_USER to lsiams_migrate for this step.
-php bin/console migrate
-php bin/console seed                       # idempotent: picks up new permissions and settings
-# switch DB_USER back to lsiams_app
+sudo -u www-data php bin/console migrate   # each migration all-or-nothing
+sudo -u www-data php bin/console seed      # idempotent: picks up new permissions and settings
 
 sudo systemctl start lsiams-worker lsiams-realtime
 sudo systemctl reload nginx
@@ -732,6 +578,12 @@ the front-end degraded. Everything still works, with a few seconds more latency.
 `systemctl status lsiams-realtime`, and check that 8443 is open and that the
 terminal's TLS certificate covers the address in `REALTIME_WS_PUBLIC_URL`.
 
-**Deadlock retries appear in the log.** Under normal load this is expected
-occasionally and handled. If it is constant, `innodb_lock_wait_timeout` is
-probably set higher than 5, or a long-running report is holding locks.
+**"Database busy, retrying the transaction" appears in the log.** A write waited
+longer than `DB_BUSY_TIMEOUT_MS` for another one and was retried. Occasional
+retries under a burst of taps are handled. If it is constant, something is
+holding a write transaction open — look for a console command or a script left
+running against the file.
+
+**"attempt to write a readonly database".** The database file or its folder is
+not writable by the account running PHP, usually because a command was run as
+root and created the `-wal` file. `chown -R www-data:www-data storage/database`.

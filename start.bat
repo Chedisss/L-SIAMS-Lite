@@ -4,8 +4,10 @@ REM  L-SIAMS - start everything
 REM
 REM  Double-click this file. On the first run it sets itself up: copies the
 REM  local configuration, generates the cryptographic keys, creates the
-REM  database, applies the schema and asks you to make an administrator
-REM  account. On every run after that it just starts the system.
+REM  database (or imports it from the MariaDB version), applies the schema and
+REM  asks you to make an administrator account. On every run after that it
+REM  just starts the system. No MySQL is needed: the database is one file,
+REM  storage\database\lsiams.sqlite.
 REM
 REM  Three windows open and stay open while the system runs:
 REM     L-SIAMS web       the site itself
@@ -196,53 +198,52 @@ if errorlevel 1 (
     echo        %HTTPSURL%
     echo.
     echo        This window will start the worker and the realtime server only.
-    echo        Start Apache and MySQL yourself in the XAMPP Control Panel.
+    echo        Start Apache yourself in the XAMPP Control Panel.
 )
 
 REM --------------------------------------------------------- database ------
-REM Start MySQL yourself in the XAMPP Control Panel; this only checks it.
+REM The database is one file, storage\database\lsiams.sqlite. There is no
+REM server to start and nothing to wait for: either the file is there, or this
+REM is a new installation, or one that has not been brought over yet.
 echo.
 echo   Checking the database...
 "%PHP%" bin\env-check.php database >nul 2>&1
+set "DBSTATE=!errorlevel!"
 
-if errorlevel 1 (
-    REM Reachable server but missing database is the common first-run case,
-    REM so try to create it before giving up.
-    echo   [..] Database not reachable - trying to create it
-    set "MYSQL="
-    for %%D in (C D E) do (
-        if not defined MYSQL if exist "%%D:\xampp\mysql\bin\mysql.exe" set "MYSQL=%%D:\xampp\mysql\bin\mysql.exe"
+if "!DBSTATE!"=="3" (
+    REM No file yet. Asked rather than assumed: silently creating an empty
+    REM database on the day a school moves over from MariaDB would start the
+    REM system with no students in it, and look exactly like lost data.
+    echo.
+    echo   There is no database in this folder yet.
+    echo.
+    echo     [I]  Import my data from the MariaDB ^(XAMPP MySQL^) version of L-SIAMS
+    echo     [N]  Start with a new, empty database
+    echo     [Q]  Quit
+    echo.
+    choice /c INQ /n /m "  Choose I, N or Q: "
+    if errorlevel 3 exit /b 0
+    if errorlevel 2 (
+        set "FIRSTRUN=1"
+    ) else (
+        call import-from-mariadb.bat
+        if errorlevel 1 exit /b 1
     )
-    if defined MYSQL (
-        "!MYSQL!" -u root -e "CREATE DATABASE IF NOT EXISTS lsiams_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >nul 2>&1
-    )
-
-    "%PHP%" bin\env-check.php database >nul 2>&1
-    if errorlevel 1 (
-        echo.
-        echo   [X] Cannot connect to MySQL.
-        echo.
-        REM Re-run without the redirect. The check knows exactly which of the
-        REM three failures this is - nothing listening, something listening
-        REM that is not MySQL, or MySQL refusing the credentials - and the
-        REM launcher guessing "start MySQL" at all three sent people to the
-        REM Control Panel to look at a service that was already running.
-        "%PHP%" bin\env-check.php database
-        echo.
-        echo       Most often this is simply MySQL not started:
-        echo         1. Open the XAMPP Control Panel
-        echo         2. Press Start next to MySQL
-        echo         3. Run this file again
-        echo.
-        echo       If MySQL is running and the message above says otherwise,
-        echo       check DB_HOST, DB_PORT, DB_USER and DB_PASS in the .env
-        echo       file in this folder.
-        echo.
-        pause
-        exit /b 1
-    )
+) else if not "!DBSTATE!"=="0" (
+    echo.
+    echo   [X] The database file would not open.
+    echo.
+    REM Run again without the redirect so the actual reason is on screen.
+    "%PHP%" bin\env-check.php database
+    echo.
+    echo       Check that storage\database\lsiams.sqlite is not read-only and
+    echo       was not damaged in a copy. console.bat doctor checks it in detail;
+    echo       a backup can be restored from the Backups page or with db:import.
+    echo.
+    pause
+    exit /b 1
 )
-echo   [ok] Database connected
+echo   [ok] Database ready
 
 REM --------------------------------------------------------- migrations ----
 REM `migrate` only applies what is pending, so this is safe on every run.
@@ -308,9 +309,9 @@ if defined HTTPSMODE (
     echo      Worker:   closing expired sessions, marking devices offline
     echo      Realtime: live updates on the dashboards
     echo.
-    echo    Apache and MySQL are started from the XAMPP Control
-    echo    Panel, not from here. If the site does not load, that
-    echo    is where to look first.
+    echo    Apache is started from the XAMPP Control Panel, not
+    echo    from here. If the site does not load, that is where
+    echo    to look first.
     echo.
     echo    Check everything at once with:  console.bat doctor
     echo.

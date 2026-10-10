@@ -6,7 +6,8 @@ REM    console.bat seed --demo          fill the system with sample data
 REM    console.bat user:create-admin    add another administrator
 REM    console.bat backup               take an encrypted backup now
 REM    console.bat migrate:status       show which migrations have run
-REM    console.bat schema:dump          rebuild the phpMyAdmin import file
+REM    console.bat schema:dump          rebuild database\lsiams_schema.sql
+REM    console.bat db:import-mysql      bring data over from the MariaDB version
 REM    console.bat                      list every command
 REM ===========================================================================
 

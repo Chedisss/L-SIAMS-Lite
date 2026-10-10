@@ -87,7 +87,9 @@ sensor validates.
 
 Handled at the schema. `UNIQUE KEY uq_attendance_session_student (session_id,
 student_id)` makes a duplicate structurally impossible; the second insert fails
-with error 1062 and the application translates that into `DUPLICATE_TIME_IN`.
+with a unique-constraint error and the application translates that into
+`DUPLICATE_TIME_IN`. `tests/concurrency/parallel.php` races real processes
+against this, every card tapped twice at once, and asserts one row per student.
 
 This is the difference between a system that is correct under load and one that
 merely appears to be. A `SELECT` followed by an `INSERT` would let two concurrent
@@ -98,8 +100,7 @@ test suite fires exactly this case and asserts one row.
 ### An administrator edits attendance to cover something up
 
 Constrained and recorded. Attendance rows cannot be deleted — a `BEFORE DELETE`
-trigger raises `SQLSTATE 45000` and the application's database user has no
-`DELETE` privilege on the table.
+trigger refuses the statement, whoever sends it.
 
 They can be *corrected*, because genuine mistakes happen, but:
 
@@ -112,24 +113,30 @@ They can be *corrected*, because genuine mistakes happen, but:
 - the correction is also written to the audit log, which cannot be modified or
   deleted at all.
 
-An administrator with database credentials still cannot quietly rewrite history,
-because the application user they would be using holds no `UPDATE` on
-`audit_logs` and no `DELETE` anywhere that matters.
+An administrator using the application still cannot quietly rewrite history:
+the services have no method that would, and the database's own triggers refuse
+the statement even when it is typed by hand.
 
 ### Someone deletes the audit log to hide their tracks
 
-Blocked at three independent layers, any one of which would suffice:
+Blocked at two layers inside the system, and a third outside it:
 
 1. No update or delete method exists on `AuditService`. There is no code to call.
-2. `BEFORE UPDATE` and `BEFORE DELETE` triggers raise `SQLSTATE 45000`.
-3. The application's database user is granted only `INSERT` and `SELECT` on
-   `audit_logs`, `security_logs` and `login_history`.
+2. `BEFORE UPDATE` and `BEFORE DELETE` triggers refuse the statement — whatever
+   sends it, including arbitrary SQL run through a compromised application.
+   `console.bat security:privileges` proves this on every run by attempting each
+   forbidden change on a real row inside a transaction it always rolls back.
+3. The file. SQLite has no database accounts, so the MariaDB version's third
+   layer — an application user with no `DELETE` grant — has no equivalent.
+   Its place is taken by the operating system: whoever can write
+   `storage\database\lsiams.sqlite` can open it with any SQLite tool and drop
+   the triggers. Keep that folder writable only by the account that runs
+   L-SIAMS, and keep backups off the machine.
 
-Layer 3 is the one that survives an application compromise: an attacker running
-arbitrary SQL as `lsiams_app` still cannot delete a log row.
-
-Defeating all three requires the MySQL root credential, which the application
-does not hold and which should not live on the same machine.
+An attacker who only reaches the application can therefore not delete a log
+row; one with write access to the database file can, which is why the file's
+permissions and off-machine backups are part of the design rather than an
+afterthought.
 
 ### Brute force against a login
 
@@ -501,9 +508,10 @@ trustworthy.
 7. **`APP_KEY` is a single point of failure.** It encrypts HMAC secrets and
    backups. Lose it and the backups are unrecoverable; leak it together with a
    database dump and the HMAC secrets are exposed.
-8. **The audit log can be truncated by anyone holding the MySQL root
-   credential.** The application cannot defend against a credential it does not
-   hold. Off-machine backups are the mitigation.
+8. **The audit log can be truncated by anyone who can write the database
+   file.** SQLite has no accounts to withhold a privilege from, so the
+   protection is the operating system's: restrict `storage\database` to the
+   account that runs L-SIAMS. Off-machine backups are the mitigation.
 9. **No intrusion detection.** The system logs and scores security events but
    does not act on them beyond rate limiting, account locking and API-key
    auto-revocation. Someone has to read the Security Center.

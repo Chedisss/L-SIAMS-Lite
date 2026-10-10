@@ -1,7 +1,16 @@
-# L-SIAMS
+# L-SIAMS-Lite
 
 **Local IoT-Based Multi-Layer Secured Attendance Monitoring System with RFID and
 Biometric Authentication**
+
+L-SIAMS-Lite is L-SIAMS with its database in a single SQLite file
+(`storage/database/lsiams.sqlite`) instead of MariaDB/MySQL. The pages, the
+terminals, the firmware and the device API are unchanged; there is simply no
+database server to install, start or keep running.
+
+**Moving over from the MariaDB version?** Follow
+[`docs/MIGRATING-FROM-MARIADB.md`](docs/MIGRATING-FROM-MARIADB.md) — bring your
+old `.env`, then run `import-from-mariadb.bat`.
 
 A school attendance system that runs entirely on the school's own LAN. Students
 tap an RFID card on a classroom terminal to record arrival and departure; a
@@ -29,14 +38,15 @@ no cloud service, no external API, and no internet dependency at runtime.
 
 ## Requirements
 
-- **PHP 8.1 or newer.** Required: `pdo_mysql`, `openssl`, `mbstring`, `json`,
+- **PHP 8.1 or newer.** Required: `pdo_sqlite`, `openssl`, `mbstring`, `json`,
   `zlib`. Optional: `zip` (Excel export and the bulk device provisioning
   bundle) and `gd` (profile photo uploads) — the system runs without them and
   each feature says what to enable if you use it. Developed and tested on 8.4;
   nothing in the codebase uses a construct newer than 8.1.
-- **MariaDB 10.6+** or **MySQL 8.0**. Verified against MariaDB 10.11 — which is
-  also what runs underneath phpMyAdmin in a XAMPP install. MySQL 8 is supported
-  but has not been exercised here.
+- **SQLite 3.31 or newer** — the copy compiled into PHP, so nothing to install.
+  Every PHP 8.1+ build ships a newer one; `doctor.bat` checks. (`pdo_mysql` is
+  needed only once, by `import-from-mariadb.bat`, to read an old MariaDB
+  database directly; importing from a backup file does not need it.)
 - **Apache 2.4** with `mod_rewrite`, or **nginx** with PHP-FPM
 - ESP32 terminals with an MFRC522 RFID reader and an AS608 or R307 fingerprint
   sensor. No display is needed — see [`firmware/README.md`](firmware/README.md)
@@ -59,7 +69,7 @@ cd /var/www/lsiams
 
 cp .env.example .env
 php bin/console key:generate      # writes APP_KEY, API_KEY_PEPPER, REALTIME_TICKET_SECRET
-# edit .env: database credentials, TRUSTED_*_CIDRS
+# edit .env: TRUSTED_*_CIDRS (the database is storage/database/lsiams.sqlite; DB_PATH moves it)
 # APP_URL and REALTIME_WS_PUBLIC_URL may be left blank — the base URL and the
 # realtime endpoint then follow the address each browser used, so one PC serves
 # localhost and the whole LAN without either being configured. Set them behind
@@ -71,9 +81,10 @@ php bin/console install           # migrate + seed + create the first administra
 ### Windows and XAMPP — just run `start.bat`
 
 Double-click **`start.bat`**. On its first run it copies the local
-configuration, generates the cryptographic keys, creates the database, applies
-the schema and asks you to make an administrator account; after that it simply
-starts everything and opens the browser at <http://localhost:8080>.
+configuration, generates the cryptographic keys, creates the database — or, if
+you choose, imports it from the MariaDB version — applies the schema and asks
+you to make an administrator account; after that it simply starts everything
+and opens the browser at <http://localhost:8080>.
 
 Three windows stay open while the system runs — the site, the maintenance
 worker and the realtime server. **`stop.bat`** closes all three.
@@ -88,7 +99,7 @@ and the realtime server, and changes nothing.
 
 ```
 doctor.bat                     check the installation and report problems
-mysql-doctor.bat               find out why MySQL will not stay started
+import-from-mariadb.bat        bring the data over from the MariaDB version
 console.bat seed --demo        fill the system with sample data
 console.bat user:create-admin  add another administrator
 console.bat backup             take an encrypted backup
@@ -100,8 +111,8 @@ reports and the backups alone, which is the reason to use it rather than
 deleting the folder and downloading the ZIP again. On its first run it offers to
 link an unzipped folder to the repository; that part happens once.
 
-You still start **MySQL** yourself from the XAMPP Control Panel; `start.bat`
-checks for it and tells you if it is not running.
+There is no database server to start. XAMPP is used only for its PHP (and,
+behind HTTPS, its Apache); MySQL can stay off.
 
 > `start.bat` uses PHP's built-in web server rather than Apache, so it needs no
 > XAMPP configuration at all. That server is single threaded, which is fine for
@@ -117,29 +128,16 @@ checks for it and tells you if it is not running.
 > (one open stream blocks a single-threaded server completely — measured, not
 > assumed). **Do not deploy that file.**
 
-### Installing through phpMyAdmin instead
+### The schema in one file
 
-If you administer the database through phpMyAdmin — a XAMPP install, typically —
-you do not need to run the migrations from a shell:
-
-1. In phpMyAdmin, open **Import** and upload
-   [`database/lsiams_schema.sql`](database/lsiams_schema.sql). That single file
-   carries every table, view, trigger, index and constraint, plus the reference
-   data the system needs to start. It creates the `lsiams_db` database and
-   selects it on the way in, so you do not have to make one first.
-2. Copy `.env.example` to `.env` and fill in the database credentials
-   (XAMPP's defaults are user `root` with an empty password).
-3. Run `php bin/console key:generate` once, then
-   `php bin/console user:create-admin` to create the first login.
-
-If you paste the file's contents into the **SQL** tab rather than using
-**Import**, make sure `lsiams_db` is selected in the left sidebar first, or
-MySQL answers every statement with `#1046 - No database selected`.
-
-The schema file deliberately contains **no user accounts and no student,
-teacher or attendance data** — a schema that shipped a known login would be a
-backdoor in every installation that used it. Regenerate it after any migration
-with `php bin/console schema:dump`.
+[`database/lsiams_schema.sql`](database/lsiams_schema.sql) holds every table,
+index, view and trigger plus the reference data a new installation starts with,
+as one SQLite script — for reading, or for
+`sqlite3 storage/database/lsiams.sqlite < database/lsiams_schema.sql`. It
+deliberately contains **no user accounts and no student, teacher or attendance
+data**: `schema:dump` builds it from a scratch database and refuses to write it
+if any table that could hold a person is not empty. Regenerate it after any
+migration with `php bin/console schema:dump`.
 
 `install` runs the migrations, seeds the reference data (roles, permissions,
 grade levels, departments, the attendance-status vocabulary and the default
@@ -220,14 +218,17 @@ tests/tls/         Certificate authority, chain and extension checks
 per classroom", "one active card per student", "one device per classroom role"
 and "one attendance record per student per session" are all enforced by UNIQUE
 keys over generated columns. A check-then-insert in PHP would lose the race under
-load; a UNIQUE key cannot. The application's job is to translate error 1062 into
-a sensible business response, which it does.
+load; a UNIQUE key cannot. The application's job is to translate the
+unique-constraint error into a sensible business response, which it does.
 
 **Audit and attendance history is immutable, three times over.** The audit log,
 security log and login history are strictly append-only: no update or delete
-method exists on those services, `BEFORE UPDATE` and `BEFORE DELETE` triggers
-raise `SQLSTATE 45000`, and the application's database user holds only `INSERT`
-and `SELECT` on them.
+method exists on those services, and `BEFORE UPDATE` and `BEFORE DELETE`
+triggers refuse the statement whoever sends it. SQLite has no database accounts,
+so the last boundary is the file itself: keep `storage\database` readable only
+by the account that runs L-SIAMS. `console.bat security:privileges` attempts
+every forbidden change on a real row, inside a transaction it always rolls back,
+and reports any guard that did not hold.
 
 Attendance rows are narrower than that, because they are legitimately written
 twice — the tap-in creates the row and the tap-out completes it. So deletion is
@@ -373,7 +374,14 @@ database behind the code says so.
 
 The central case fires 50 simultaneous taps of the same card at the same session
 and asserts that exactly one attendance row exists afterwards. It runs against a
-real MySQL server, not a mock — the guarantee being tested is the database's.
+real SQLite file, not a mock — the guarantee being tested is the database's.
+
+`tests/concurrency/parallel.php` goes further and races real processes: two
+tappers per terminal on every card, all terminals at once, with readers running
+the dashboard queries throughout. Each transaction takes SQLite's write lock up
+front (`BEGIN IMMEDIATE`), so a tap waits a few milliseconds for another
+terminal's tap instead of failing; the test asserts one record per student and
+no "database is locked" anywhere.
 
 The suite freezes the clock at 10:00 for the duration of a run. A schedule is a
 time of day, and the fixture has to place a window that contains "now" while
@@ -383,8 +391,10 @@ would pass all day and fail in the evening for reasons unrelated to the code.
 Nothing under test needs real elapsed time — the dwell cases backdate `time_in`
 in SQL rather than waiting.
 
-Last verified run: 44 passed, 0 failed, tap p95 6.7 ms, 152–181 taps/second
-sustained, against MariaDB 10.11.
+Last verified run: 298 passed, 0 failed (the MariaDB version passes the same
+298). `parallel.php` with 8 terminals × 60 students and 4 readers: 960 taps, all
+correct, no errors; at up to 500 ms between each process's taps — still far
+busier than a school — median 3.5 ms and slowest 45 ms per tap.
 
 Fixtures are prefixed `TEST-CONC-` and torn down afterwards. **Point the suite at
 a test database**, never at a school's live data.
@@ -395,11 +405,12 @@ a test database**, never at a school's live data.
 
 | | |
 |---|---|
+| [`docs/MIGRATING-FROM-MARIADB.md`](docs/MIGRATING-FROM-MARIADB.md) | Bringing an existing installation's data over from the MariaDB version |
 | [`docs/RUNNING-ON-WINDOWS.md`](docs/RUNNING-ON-WINDOWS.md) | Step-by-step first run on Windows with XAMPP, and what to do when it breaks |
 | [`docs/NETWORK-ACCESS.md`](docs/NETWORK-ACCESS.md) | Reaching the system from phones and laptops on the same school network |
 | [`docs/MOVING-TO-ANOTHER-PC.md`](docs/MOVING-TO-ANOTHER-PC.md) | Moving the system to a different computer, or onto a new router and a new IP address, without losing the fingerprints and the terminals |
 | [`docs/HTTPS.md`](docs/HTTPS.md) | Turning on encryption: issuing the certificate, configuring Apache, trusting the root on PCs and terminals |
-| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Web server, TLS, systemd, MySQL tuning, database privileges, backups |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Web server, TLS, systemd, the database file and its permissions, backups |
 | [`docs/API.md`](docs/API.md) | Device API, request signing, error codes, browser API |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | The security model, threat by threat |
 | [`docs/FIRMWARE.md`](docs/FIRMWARE.md) | Wiring, flashing, provisioning and the terminal state machine |

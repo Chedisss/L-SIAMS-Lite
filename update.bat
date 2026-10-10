@@ -18,7 +18,7 @@ setlocal
 title L-SIAMS update
 cd /d "%~dp0"
 
-set "REPO=https://github.com/Chedisss/L-SIAMS.git"
+set "REPO=https://github.com/Chedisss/L-SIAMS-Lite.git"
 set "BRANCH=main"
 
 echo.
@@ -203,7 +203,8 @@ echo   Applying database changes...
 if errorlevel 1 (
     echo.
     echo   [X] The database step failed.
-    echo       Is MySQL started in the XAMPP Control Panel?
+    echo       Run  console.bat doctor  to see what is wrong with the database.
+    echo       Nothing was half-applied: each migration is all or nothing.
     echo.
     pause
     exit /b 1
