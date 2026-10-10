@@ -779,6 +779,50 @@ final class Database
         }
     }
 
+    /**
+     * Rows whose foreign key points at nothing, counted per child and parent
+     * table: ['subjects -> departments' => 1, ...].
+     *
+     * Used before and after a schema change to tell a change that broke a
+     * reference from rows that were already orphaned — an import run with
+     * checks off, for instance — which a change must not be blamed for.
+     *
+     * @return array<string,int>
+     */
+    public function foreignKeyViolations(): array
+    {
+        $counts = [];
+
+        foreach ($this->select('PRAGMA foreign_key_check') as $row) {
+            $key          = $row['table'] . ' -> ' . $row['parent'];
+            $counts[$key] = ($counts[$key] ?? 0) + 1;
+        }
+
+        ksort($counts);
+
+        return $counts;
+    }
+
+    /**
+     * What $after has that $before did not: references broken in between.
+     *
+     * @param  array<string,int> $before
+     * @param  array<string,int> $after
+     * @return array<string,int>
+     */
+    public static function newViolations(array $before, array $after): array
+    {
+        $new = [];
+
+        foreach ($after as $key => $count) {
+            if ($count > ($before[$key] ?? 0)) {
+                $new[$key] = $count - ($before[$key] ?? 0);
+            }
+        }
+
+        return $new;
+    }
+
     /** A FOREIGN KEY constraint refused the change. */
     public static function isForeignKeyViolation(Throwable $e): bool
     {

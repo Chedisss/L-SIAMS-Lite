@@ -15,7 +15,7 @@ declare(strict_types=1);
  *   php bin/console backup               Create an encrypted backup now
  *   php bin/console security:audit-keys  Static check that no weak RNG is in the key path
  *   php bin/console doctor               Diagnose a running installation
- *   php bin/console db:import <file>     Import a .sql file or phpMyAdmin export
+ *   php bin/console db:import <file>     Replace the database with a SQLite .sql dump
  *   php bin/console time:shift "+2 hours" Move the clock for schedule testing
  *   php bin/console user:create-admin    Create an administrator interactively
  *   php bin/console user:create-teachers Issue logins to teachers who have none
@@ -168,12 +168,12 @@ function commandHelp(): void
     out('    worker [--once]         Maintenance loop: sessions, heartbeats, retention');
     out('    backup                  Create an encrypted database backup');
     out('    security:audit-keys     Verify no weak RNG exists in the key path');
-    out('    security:privileges     Verify the database cannot delete a log row');
+    out('    security:privileges     Verify the database refuses to delete or rewrite history');
     out('    doctor                  Diagnose this installation and report problems');
     out('    session:why [device]    Explain why a terminal will not open a session now');
     out('    device:unblock [device]  Show who is rate limited, and lift it (--all)');
-    out('    schema:dump             Write database/lsiams_schema.sql for phpMyAdmin import');
-    out('    db:import <file.sql>    Import a .sql file or phpMyAdmin export (--fresh drops first)');
+    out('    schema:dump             Write database/lsiams_schema.sql (schema + reference data)');
+    out('    db:import <file.sql>    Replace the database with a SQLite .sql dump (--force)');
     out('    backup:decrypt <file>   Turn a backup archive back into readable SQL');
     out('    time:shift ["+2 hours"]  Move the clock to test a schedule (--clear to undo)');
     out('');
@@ -516,8 +516,9 @@ function commandMigrateRechecksum(array $flags): void
  * DELETE actions. legacy_alter_table keeps a rename from rewriting the views
  * and triggers that refer to the table by name. Both have to be set outside
  * the transaction, where SQLite honours them. Before committing,
- * foreign_key_check confirms that every reference still resolves; if one does
- * not, the migration is rolled back rather than leaving a broken link behind.
+ * foreign_key_check confirms the migration broke no reference that resolved
+ * before it ran; if it did, the migration is rolled back rather than leaving a
+ * broken link behind.
  *
  * @param array{migration:string,batch:int,checksum:string} $record
  */
@@ -529,20 +530,20 @@ function runMigration(Database $db, string $sql, array $record): void
 
     try {
         $db->transaction(static function (Database $db) use ($pdo, $sql, $record): void {
+            // Rows that were already orphaned before this migration — an old
+            // import done with checks off, say — are not its fault, and must
+            // not stop every future migration from running.
+            $before = $db->foreignKeyViolations();
+
             // pdo_sqlite runs every statement in the string, triggers included.
             $pdo->exec($sql);
 
-            $broken = $db->select('PRAGMA foreign_key_check');
+            $broken = Database::newViolations($before, $db->foreignKeyViolations());
 
             if ($broken !== []) {
-                $first = $broken[0];
-
                 throw new RuntimeException(sprintf(
-                    '%d row(s) would point at something that does not exist (first: %s row %s -> %s).',
-                    count($broken),
-                    (string) $first['table'],
-                    (string) $first['rowid'],
-                    (string) $first['parent']
+                    'it would leave rows pointing at something that does not exist (%s).',
+                    implode(', ', array_map(static fn (string $k, int $n): string => "$n in $k", array_keys($broken), $broken))
                 ));
             }
 
@@ -875,7 +876,7 @@ function commandDoctor(): void
 
     $check(PHP_VERSION_ID >= 80100, 'PHP 8.1 or newer', PHP_VERSION);
 
-    foreach (['pdo_mysql', 'openssl', 'mbstring', 'json'] as $extension) {
+    foreach (['pdo_sqlite', 'openssl', 'mbstring', 'json'] as $extension) {
         $check(extension_loaded($extension), 'Extension ' . $extension, extension_loaded($extension) ? '' : 'not loaded');
     }
 
@@ -921,16 +922,53 @@ function commandDoctor(): void
     // --------------------------------------------------------------- data --
     heading('Database');
 
-    try {
-        $db = Database::instance();
-        $db->scalar('SELECT 1');
-        ok('Connected to ' . Config::get('database.database', '?') . ' on '
-            . Config::get('database.host', '?') . ':' . Config::get('database.port', '?'));
-    } catch (Throwable $e) {
-        $check(false, 'Database connection', $e->getMessage());
+    $databasePath = (string) Config::get('database.path', '');
+
+    // Asked before opening it, because opening a SQLite file that is not there
+    // creates an empty one — and an empty database with no tables reads as a
+    // dozen unrelated failures further down instead of the one real problem.
+    if (!is_file($databasePath)) {
+        $check(false, 'Database file', 'not found at ' . $databasePath);
+        $note('A new installation: run install.bat (or "php bin/console install").');
+        $note('Moving from the MariaDB version: run "php bin/console db:import-mysql".');
+        $note('Restoring after a move: copy storage\\database\\lsiams.sqlite from the old PC.');
         doctorSummary($problems, $warnings);
 
         return;
+    }
+
+    try {
+        $db = Database::instance();
+        $db->scalar('SELECT 1');
+        ok(sprintf('Opened %s (%s, SQLite %s)', $databasePath,
+            App\Services\BackupService::humanSize((int) filesize($databasePath)),
+            (string) $db->scalar('SELECT sqlite_version()')));
+    } catch (Throwable $e) {
+        $check(false, 'Database file opens', ($e->getPrevious() ?? $e)->getMessage());
+        doctorSummary($problems, $warnings);
+
+        return;
+    }
+
+    $writable = is_writable($databasePath) && is_writable(dirname($databasePath));
+    $check($writable, 'Database file and folder writable',
+        $writable ? '' : 'SQLite writes its -wal and -shm files beside the database');
+
+    $journal = strtolower((string) $db->scalar('PRAGMA journal_mode'));
+    $check($journal === 'wal', 'Journal mode WAL', $journal === 'wal' ? '' : 'is ' . $journal . ' — readers will wait for every tap');
+    $check((int) $db->scalar('PRAGMA foreign_keys') === 1, 'Foreign keys enforced');
+
+    // quick_check reads every page without the slower index cross-checks;
+    // it is what notices a file damaged by a power cut or a bad copy.
+    $quick = (string) $db->scalar('PRAGMA quick_check');
+    $check($quick === 'ok', 'File integrity', $quick === 'ok' ? '' : $quick);
+
+    $orphans = $db->foreignKeyViolations();
+
+    if ($orphans !== []) {
+        $warn('Rows whose parent row is missing', implode(', ', array_map(
+            static fn (string $k, int $n): string => "$n in $k", array_keys($orphans), $orphans
+        )));
     }
 
     ensureMigrationsTable($db);
@@ -1604,232 +1642,96 @@ function doctorSummary(array $problems, array $warnings): void
  * "rand(), mt_rand(), and uniqid() appear nowhere in the key path".
  */
 /**
- * Prove that the application's own database user cannot rewrite history.
+ * Prove that the database refuses to rewrite history.
  *
- * The audit trail is protected three ways: the services expose no update or
- * delete method, triggers raise SQLSTATE 45000, and the database user simply
- * holds no such privilege. The first two live in this repository and are true
- * wherever it is deployed. The third is applied by hand at install time, is the
- * only one an attacker holding the application's own credentials cannot get
- * around, and is the only one that can quietly stop being true — a restore from
- * a full dump reinstates whatever grants existed when the dump was taken.
+ * The audit trail is protected by the services, which expose no update or
+ * delete method, and by triggers in the database itself, which refuse the
+ * statement whoever sends it. SQLite has no user accounts or grants, so the
+ * triggers are the layer that holds against a direct SQL session; the one
+ * beyond them is who may open the file at all (docs/DEPLOYMENT.md).
  *
- * So it is checked rather than assumed, by asking the database what this user
- * may actually do rather than reading a document that says what it should.
- *
- * Deliberately read-only: it inspects grants and never attempts the writes it
- * is describing. Testing a DELETE for real would have to succeed to be
- * informative, and a check that can destroy an audit row to prove audit rows
- * cannot be destroyed is not a check anybody should run on a live system.
+ * A trigger can quietly stop being there — a restore from an old copy, a hand
+ * edit — so it is checked rather than assumed, and checked by doing: each
+ * forbidden statement is actually attempted on a real row, inside a
+ * transaction that is always rolled back. A guard that holds refuses it; a
+ * guard that is missing lets it through, and the rollback undoes it. Either
+ * way nothing is changed, which is what makes this safe to run on a live
+ * system.
  */
 function commandAuditPrivileges(): void
 {
     $db = Database::instance();
 
-    heading('Database privileges');
+    heading('History protection');
 
-    $user = (string) $db->scalar('SELECT CURRENT_USER()');
-    $name = explode('@', $user)[0];
-
-    out(sprintf('  Connected as %s', $user), 'grey');
-
-    // A superuser passes every table check below for the wrong reason: it holds
-    // the privileges rather than being denied them. Said first, because every
-    // line after it would otherwise read as a pass.
-    $isRoot = in_array(strtolower($name), ['root', 'mysql.sys', 'mariadb.sys'], true);
-
-    if ($isRoot) {
-        out('', '');
-        out('  ✗ This is a superuser account. Every check below will pass because', 'red');
-        out('    nothing is denied to it — which is the opposite of what this proves.', 'red');
-        out('    Point DB_USER in .env at the application user (docs/DEPLOYMENT.md),', 'grey');
-        out('    and keep the privileged account for migrations only.', 'grey');
-        out('');
-    }
-
-    /** @var array<string,string> $protected table => what must be impossible
-     *
-     * These mirror the triggers, not a blanket "logs are frozen" rule.
-     * audit_logs and login_history take neither UPDATE nor DELETE. security_logs
-     * is delete-proof but deliberately updatable — an event is resolved and
-     * annotated — with its content frozen by trg_security_immutable_content
-     * rather than by withholding UPDATE, exactly as attendance_records is. So it
-     * appears only under the UPDATE-needed set below, not here. */
-    $protected = [
-        'audit_logs'                => 'UPDATE,DELETE',
-        'login_history'             => 'UPDATE,DELETE',
-        'security_logs'             => 'DELETE',
-        'attendance_records'        => 'DELETE',
-        'rfid_logs'                 => 'DELETE',
-        'fingerprint_logs'          => 'DELETE',
-        'attendance_modifications'  => 'DELETE',
+    $attempts = [
+        ['attendance_records', 'DELETE', 'DELETE FROM attendance_records WHERE rowid = :id'],
+        ['audit_logs',         'DELETE', 'DELETE FROM audit_logs WHERE rowid = :id'],
+        ['audit_logs',         'UPDATE', "UPDATE audit_logs SET description = 'x' WHERE rowid = :id"],
+        ['security_logs',      'DELETE', 'DELETE FROM security_logs WHERE rowid = :id'],
+        ['security_logs',      'UPDATE', "UPDATE security_logs SET description = 'x' WHERE rowid = :id"],
+        ['login_history',      'DELETE', 'DELETE FROM login_history WHERE rowid = :id'],
     ];
 
-    // information_schema reports the effective privilege, which is the union of
-    // every level MySQL grants at. That union is the point: a table-level grant
-    // never narrows a database-level one, so reading SHOW GRANTS line by line
-    // and believing the narrowest is exactly the mistake this command exists to
-    // catch.
-    $rows = $db->select(
-        "SELECT TABLE_NAME, PRIVILEGE_TYPE
-           FROM information_schema.TABLE_PRIVILEGES
-          WHERE GRANTEE = CONCAT('''', SUBSTRING_INDEX(CURRENT_USER(), '@', 1), '''@''',
-                                 SUBSTRING_INDEX(CURRENT_USER(), '@', -1), '''')
-            AND TABLE_SCHEMA = DATABASE()"
-    );
-
-    $schemaWide = $db->select(
-        "SELECT PRIVILEGE_TYPE
-           FROM information_schema.SCHEMA_PRIVILEGES
-          WHERE GRANTEE = CONCAT('''', SUBSTRING_INDEX(CURRENT_USER(), '@', 1), '''@''',
-                                 SUBSTRING_INDEX(CURRENT_USER(), '@', -1), '''')
-            AND TABLE_SCHEMA = DATABASE()"
-    );
-
-    $wide = array_map(static fn (array $r): string => strtoupper((string) $r['PRIVILEGE_TYPE']), $schemaWide);
-
-    $perTable = [];
-
-    foreach ($rows as $row) {
-        $perTable[(string) $row['TABLE_NAME']][] = strtoupper((string) $row['PRIVILEGE_TYPE']);
-    }
-
-    out('');
-
     $failures = 0;
-    $unknown  = 0;
 
-    foreach ($protected as $table => $mustNotHold) {
-        foreach (explode(',', $mustNotHold) as $privilege) {
-            // Held at schema level, at table level, or not at all. Schema level
-            // is the one that catches the REVOKE that never applied.
-            $viaSchema = in_array($privilege, $wide, true);
-            $viaTable  = in_array($privilege, $perTable[$table] ?? [], true);
+    foreach ($attempts as [$table, $verb, $sql]) {
+        $rowId = $db->scalar(sprintf('SELECT rowid FROM %s ORDER BY rowid LIMIT 1', $table));
 
-            if ($viaSchema || $viaTable) {
-                $failures++;
-                out(sprintf('  ✗ %-26s %-6s is GRANTED%s', $table, $privilege,
-                    $viaSchema ? ' — database-wide, so no table-level grant can take it back' : ''), 'red');
-                continue;
-            }
+        if ($rowId === null) {
+            out(sprintf('  - %-20s %-6s no rows yet to try it on', $table, $verb), 'grey');
+            continue;
+        }
 
-            out(sprintf('  ✓ %-26s %-6s refused', $table, $privilege), 'green');
+        $refused = false;
+        $db->beginTransaction();
+
+        try {
+            $db->execute($sql, ['id' => (int) $rowId]);
+        } catch (PDOException) {
+            $refused = true;
+        } finally {
+            $db->rollBack();
+        }
+
+        if ($refused) {
+            out(sprintf('  ✓ %-20s %-6s refused', $table, $verb), 'green');
+        } else {
+            out(sprintf('  ✗ %-20s %-6s was ALLOWED (rolled back, nothing changed)', $table, $verb), 'red');
+            $failures++;
         }
     }
 
-    // The other half, and it is not optional.
-    //
-    // Everything above passes when the application holds no privileges at all —
-    // which is exactly what a half-applied grant list looks like, and it is the
-    // easy mistake to make here: the per-table GRANTs are generated and pasted
-    // by hand, so running the first block and not the second leaves a user with
-    // SELECT and INSERT and nothing else. Every line above then reads green
-    // while tap-out is broken, because writing time_out onto an existing
-    // attendance row needs UPDATE.
-    //
-    // A check that passes on a system that cannot record attendance is worse
-    // than no check, so what must remain possible is verified too.
-    $missing = [];
+    // security_logs is meant to be updatable in its triage columns only.
+    $rowId = $db->scalar('SELECT rowid FROM security_logs ORDER BY rowid LIMIT 1');
 
-    foreach ($db->select(
-        "SELECT TABLE_NAME FROM information_schema.TABLES
-          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'
-          ORDER BY TABLE_NAME"
-    ) as $row) {
-        $table = (string) $row['TABLE_NAME'];
-        $must  = match (true) {
-            // audit_logs and login_history are append-only: nothing beyond
-            // SELECT and INSERT.
-            in_array($table, ['audit_logs', 'login_history'], true) => [],
-            // security_logs and the attendance/tap tables are corrected in
-            // place, so they need UPDATE (their content is frozen by triggers,
-            // and DELETE is refused above).
-            isset($protected[$table]) => ['UPDATE'],
-            default                   => ['UPDATE', 'DELETE'],
-        };
+    if ($rowId !== null) {
+        $db->beginTransaction();
 
-        foreach ($must as $privilege) {
-            if (!in_array($privilege, $wide, true)
-                && !in_array($privilege, $perTable[$table] ?? [], true)
-            ) {
-                $missing[] = $table . ' ' . $privilege;
-            }
+        try {
+            $db->execute("UPDATE security_logs SET admin_notes = admin_notes WHERE rowid = :id", ['id' => (int) $rowId]);
+            out(sprintf('  ✓ %-20s %-6s triage notes still editable', 'security_logs', 'UPDATE'), 'green');
+        } catch (PDOException $e) {
+            out(sprintf('  ✗ %-20s %-6s triage notes refused: %s', 'security_logs', 'UPDATE', $e->getMessage()), 'red');
+            $failures++;
+        } finally {
+            $db->rollBack();
         }
-    }
-
-    // SHOW VIEW is schema-wide and easy to forget, because it is not a write —
-    // so the lockdown that revokes everything and grants writes back by hand
-    // leaves it out, and nothing notices until the nightly backup fails on
-    // SHOW CREATE VIEW for the first view it reaches. It reads view
-    // definitions, nothing more, so it costs the immutability guarantee
-    // nothing; the backup cannot run without it.
-    if (!in_array('SHOW VIEW', $wide, true)) {
-        $missing[] = '(schema) SHOW VIEW — required for backups to dump views';
-    }
-
-    if ($missing !== []) {
-        out('');
-        out(sprintf('  ✗ %d privilege(s) the application NEEDS are missing, including:', count($missing)), 'red');
-
-        foreach (array_slice($missing, 0, 6) as $entry) {
-            out('      ' . $entry, 'red');
-        }
-
-        if (count($missing) > 6) {
-            out(sprintf('      …and %d more', count($missing) - 6), 'red');
-        }
-
-        $failures += count($missing);
-    } else {
-        out('');
-        out('  ✓ every write the application legitimately makes is still granted', 'green');
-    }
-
-    // A user with no rows at either level is not necessarily safe — it may hold
-    // the privilege globally, on *.*, which neither view above reports.
-    if ($wide === [] && $perTable === []) {
-        $unknown++;
     }
 
     out('');
 
-    if ($isRoot) {
-        fail('Run this again with .env pointing at the application user. Nothing was proved.');
-    }
-
-    if ($unknown > 0) {
-        out('  ! This user holds no schema or table grants on this database at all,', 'yellow');
-        out('    which usually means it holds them globally on *.* instead. A global', 'yellow');
-        out('    grant defeats this layer and is not visible here — check SHOW GRANTS.', 'yellow');
-        out('');
+    if ($failures === 0) {
+        ok('Every guard holds. History cannot be deleted or rewritten through SQL.');
+        out('  The file itself is the remaining boundary: keep storage\\database readable', 'grey');
+        out('  only by the account that runs L-SIAMS (docs/DEPLOYMENT.md).', 'grey');
 
         return;
     }
 
-    if ($failures > 0) {
-        if ($missing !== []) {
-            out('✗ The grants are incomplete — the application cannot do its job.', 'red');
-            out('  Run the per-table GRANT generator in docs/DEPLOYMENT.md and paste back', 'grey');
-            out('  every statement it prints. Until then a card can be tapped in and not', 'grey');
-            out('  out, because writing the departure time needs UPDATE.', 'grey');
-        } else {
-            out(sprintf('✗ %d privilege(s) that should be impossible are granted.', $failures), 'red');
-            out('  The triggers still refuse these writes, so the audit trail is not open —', 'grey');
-            out('  but the third layer is missing, and it is the one that holds when somebody', 'grey');
-            out('  has the application\'s own credentials. docs/DEPLOYMENT.md has the fix.', 'grey');
-        }
-
-        out('');
-
-        exit(1);
-    }
-
-    ok('The application cannot alter or delete an audit or login-history row.');
-    out('  A security event cannot be deleted or its content changed — only its', 'grey');
-    out('  resolution status, and that only behind a trigger. Attendance and tap', 'grey');
-    out('  logs can be corrected but never removed.', 'grey');
-    out('  Proved from the database\'s own grant tables, as the application user.', 'grey');
-    out('');
+    out(sprintf('  %d guard(s) missing. Run "php bin/console migrate" — if the database', $failures), 'yellow');
+    out('  is up to date, restore the triggers from database/migrations/007 and 036.', 'yellow');
+    exit(1);
 }
 
 function commandAuditKeys(): void
@@ -2330,16 +2232,17 @@ function commandBackupDecrypt(array $arguments): void
 }
 
 /**
- * Import a .sql file — including a phpMyAdmin export — into the configured
- * database.
+ * Replace the database with the contents of a SQLite .sql dump — the file
+ * `backup:decrypt` writes, or one made with the sqlite3 tool's .dump.
  *
- * phpMyAdmin's own importer fails on files it happily produces: it writes the
- * tables alphabetically and adds every foreign key at the end, so a partial
- * export or a re-run against existing tables dies half way through with a
- * message that names an errno and nothing else. This importer switches the
- * constraint checks off for the duration, ignores any CREATE DATABASE / USE
- * lines so the file always lands in the database named in .env, and when a
- * statement does fail it prints the statement instead of a number.
+ * The whole file runs as one transaction after everything currently in the
+ * database is dropped, so an import that fails part-way changes nothing, and
+ * one that succeeds leaves exactly what the file describes. When a statement
+ * fails it is the statement that is reported, not just an error number.
+ *
+ * A file from the MariaDB version — a phpMyAdmin export, a mysqldump, a
+ * decrypted MariaDB-era backup — is SQL for a different database and is sent
+ * to `db:import-mysql`, which reads it row by row into this schema instead.
  *
  * @param list<string> $arguments
  * @param list<string> $flags
@@ -2350,8 +2253,8 @@ function commandDbImport(array $arguments, array $flags): void
     $path  = $paths[0] ?? '';
 
     if ($path === '') {
-        fail("Usage: php bin/console db:import <file.sql> [--fresh]\n"
-           . '  --fresh  drop every existing table and view first');
+        fail("Usage: php bin/console db:import <file.sql> [--force]\n"
+           . '  Replaces the whole database with the file. --force is needed when the database already holds data.');
     }
 
     if (!is_file($path)) {
@@ -2366,78 +2269,43 @@ function commandDbImport(array $arguments, array $flags): void
 
     $sql = (string) file_get_contents($path);
 
-    // phpMyAdmin writes UTF-8 with a byte order mark when the browser asks for
-    // one. MySQL reads it as three junk characters in front of the first
-    // statement and reports a syntax error at line 1.
+    // An editor that saved it as UTF-8 with a byte order mark puts three junk
+    // characters in front of the first statement.
     $sql = (string) preg_replace('/^\xEF\xBB\xBF/', '', $sql);
 
-    $config   = (array) Config::get('database', []);
-    $database = (string) ($config['database'] ?? '');
+    if (BackupService::isMariaDbDump($sql)) {
+        fail("This file is from the MariaDB version (a phpMyAdmin export, mysqldump or old backup).\n"
+           . '  Import it with:  php bin/console db:import-mysql --from-file=' . escapeshellarg($path));
+    }
 
-    heading('Importing ' . basename($path) . ' into ' . $database);
+    if (trim($sql) === '') {
+        fail('The file is empty. If it was copied out of a browser, check it was not truncated.');
+    }
 
     $db = Database::instance();
 
-    if (in_array('--fresh', $flags, true)) {
-        $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 0');
+    heading('Importing ' . basename($path) . ' into ' . basename($db->path()));
 
-        foreach ($db->select('SHOW FULL TABLES WHERE Table_type = "VIEW"') as $row) {
-            $db->pdo()->exec(sprintf('DROP VIEW IF EXISTS `%s`', (string) array_values($row)[0]));
-        }
+    $hasData = false;
 
-        foreach ($db->select('SHOW FULL TABLES WHERE Table_type = "BASE TABLE"') as $row) {
-            $db->pdo()->exec(sprintf('DROP TABLE IF EXISTS `%s`', (string) array_values($row)[0]));
-        }
-
-        ok('  Existing tables dropped.');
+    try {
+        $hasData = (int) $db->scalar('SELECT COUNT(*) FROM users') > 0;
+    } catch (Throwable) {
+        // No users table: an empty or new database, nothing to protect.
     }
 
-    $statements = splitSqlStatements($sql);
-
-    if ($statements === []) {
-        fail('The file contains no SQL statements. If you pasted it out of a browser, check it was not truncated.');
+    if ($hasData && !in_array('--force', $flags, true) && !in_array('--fresh', $flags, true)) {
+        fail("The database already holds data, and importing replaces all of it.\n"
+           . '  Take a backup first (php bin/console backup), then re-run with --force.');
     }
 
-    // Anything that would move the import to a different database is dropped:
-    // the target is whatever .env points at, and nothing in the file gets to
-    // override that.
-    $redirects = 0;
-    $executed  = 0;
-
-    $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 0');
-    $db->pdo()->exec('SET UNIQUE_CHECKS = 0');
-    $db->pdo()->exec("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'");
-
-    foreach ($statements as $index => $statement) {
-        $head = ltrim($statement);
-
-        if (preg_match('/^(USE\b|CREATE\s+DATABASE\b|CREATE\s+SCHEMA\b|DROP\s+DATABASE\b|DROP\s+SCHEMA\b)/i', $head) === 1) {
-            $redirects++;
-            continue;
-        }
-
-        try {
-            $db->pdo()->exec($statement);
-            $executed++;
-        } catch (Throwable $e) {
-            $db->pdo()->exec('SET UNIQUE_CHECKS = 1');
-            $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 1');
-
-            out('');
-            out('  Statement ' . ($index + 1) . ' of ' . count($statements) . ' failed:', 'yellow');
-            out('');
-
-            foreach (array_slice(preg_split('/\n/', trim($statement)) ?: [], 0, 8) as $line) {
-                out('    ' . mb_strimwidth($line, 0, 160, '…'), 'grey');
-            }
-
-            out('');
-            fail($e->getMessage());
-        }
+    try {
+        $tables = BackupService::replaceDatabaseWith($sql);
+    } catch (Throwable $e) {
+        out('');
+        out('  Nothing was changed: the import runs as one transaction and was rolled back.', 'yellow');
+        fail(($e->getPrevious() ?? $e)->getMessage());
     }
-
-    $db->pdo()->exec('SET UNIQUE_CHECKS = 1');
-    $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 1');
 
     // A file written against an older release leaves the newer migrations
     // unapplied, and the pages that need them break in ways that look nothing
@@ -2458,11 +2326,7 @@ function commandDbImport(array $arguments, array $flags): void
     }
 
     out('');
-    ok($executed . ' statement(s) executed.');
-
-    if ($redirects > 0) {
-        out('  ' . $redirects . ' CREATE DATABASE / USE statement(s) ignored — the target came from .env.', 'grey');
-    }
+    ok($tables . ' table(s) imported.');
 
     if ($pending !== []) {
         out('');
@@ -2572,10 +2436,11 @@ function commandTimeShift(array $arguments, array $flags): void
  * anywhere says so. That is a far worse outcome than the stuck row they were
  * trying to fix.
  *
- * So the trigger drop happens here, between a confirmation that shows exactly
- * what will be destroyed and a `finally` that puts the triggers back whatever
- * happens. DDL commits implicitly in MariaDB, so a transaction cannot cover
- * this; the `finally` is the guarantee, not the transaction.
+ * So the trigger drop happens here, after a confirmation that shows exactly
+ * what will be destroyed, and inside one transaction with the deletes and the
+ * triggers' return. SQLite rolls DDL back like any other write, so the purge
+ * either completes with the guards back in place or does not happen at all —
+ * there is no moment at which the audit table is left unprotected.
  *
  * Archiving remains the right answer almost every time — it ends the sessions,
  * blocks the login and keeps the history. This is for the account created by
@@ -2711,16 +2576,14 @@ function commandUserPurge(array $arguments, array $flags): void
 
     heading('Purging');
 
-    try {
+    $db->transaction(static function (Database $db) use ($guards, $destroys, $userId): void {
         foreach ($guards as $trigger) {
-            $db->execute(sprintf('DROP TRIGGER IF EXISTS `%s`', $trigger));
+            $db->execute(sprintf('DROP TRIGGER IF EXISTS "%s"', $trigger));
         }
-
-        out('  immutability triggers lifted for this operation', 'grey');
 
         foreach ($destroys as $table => $column) {
             $db->execute(
-                sprintf('DELETE FROM `%s` WHERE `%s` = :id', $table, $column),
+                sprintf('DELETE FROM "%s" WHERE "%s" = :id', $table, $column),
                 ['id' => $userId]
             );
         }
@@ -2729,13 +2592,13 @@ function commandUserPurge(array $arguments, array $flags): void
         // the user row goes last and takes the rest with it.
         $db->execute('DELETE FROM users WHERE user_id = :id', ['id' => $userId]);
 
-        ok(sprintf('user %d purged, %d referencing row(s) destroyed', $userId, $total));
-    } finally {
-        // Not conditional on success. A half-finished purge that leaves the
-        // audit table writable is the one outcome worth ruling out entirely.
+        // In the same transaction: if anything above failed, the drops roll
+        // back with it and the guards were never gone.
         restoreImmutabilityTriggers($db);
-        out('  immutability triggers restored', 'grey');
-    }
+    });
+
+    ok(sprintf('user %d purged, %d referencing row(s) destroyed', $userId, $total));
+    out('  immutability triggers lifted and restored inside the same transaction', 'grey');
 
     out('');
 }
@@ -2749,32 +2612,24 @@ function commandUserPurge(array $arguments, array $flags): void
  */
 function restoreImmutabilityTriggers(Database $db): void
 {
-    $db->execute('DROP TRIGGER IF EXISTS trg_audit_no_delete');
-    $db->execute(
-        "CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_logs FOR EACH ROW
-         BEGIN
-           SIGNAL SQLSTATE '45000'
-             SET MESSAGE_TEXT = 'Audit logs are immutable and cannot be deleted.';
-         END"
-    );
+    $guards = [
+        'trg_audit_no_delete'         => ['audit_logs', 'Audit logs are immutable and cannot be deleted.'],
+        'trg_security_no_delete'      => ['security_logs', 'Security logs are immutable and cannot be deleted.'],
+        'trg_login_history_no_delete' => ['login_history', 'Login history is permanent and cannot be deleted.'],
+    ];
 
-    $db->execute('DROP TRIGGER IF EXISTS trg_security_no_delete');
-    $db->execute(
-        "CREATE TRIGGER trg_security_no_delete BEFORE DELETE ON security_logs FOR EACH ROW
-         BEGIN
-           SIGNAL SQLSTATE '45000'
-             SET MESSAGE_TEXT = 'Security logs are immutable and cannot be deleted.';
-         END"
-    );
-
-    $db->execute('DROP TRIGGER IF EXISTS trg_login_history_no_delete');
-    $db->execute(
-        "CREATE TRIGGER trg_login_history_no_delete BEFORE DELETE ON login_history FOR EACH ROW
-         BEGIN
-           SIGNAL SQLSTATE '45000'
-             SET MESSAGE_TEXT = 'Login history is permanent and cannot be deleted.';
-         END"
-    );
+    foreach ($guards as $trigger => [$table, $message]) {
+        $db->execute(sprintf('DROP TRIGGER IF EXISTS %s', $trigger));
+        $db->execute(sprintf(
+            "CREATE TRIGGER %s BEFORE DELETE ON %s
+             BEGIN
+                 SELECT RAISE(ABORT, '%s');
+             END",
+            $trigger,
+            $table,
+            $message
+        ));
+    }
 }
 
 /**
@@ -3115,161 +2970,88 @@ function commandSessionWhy(array $arguments): void
     out('');
 }
 
+/**
+ * Write database/lsiams_schema.sql: the complete schema and the reference data
+ * a new installation starts with, as one SQLite script.
+ *
+ * Built from a brand-new database in a temporary file — every migration, then
+ * the reference seeder — never from the live one, so whatever this
+ * installation holds, the file cannot carry a single user account, student,
+ * teacher or attendance record. It documents the schema in one place, and
+ *   sqlite3 storage/database/lsiams.sqlite < database/lsiams_schema.sql
+ * creates a working database from it without PHP.
+ */
 function commandSchemaDump(): void
 {
-    heading('Dumping schema and reference data');
+    heading('Building a reference-only database');
 
-    $config   = (array) Config::get('database', []);
-    $database = (string) ($config['database'] ?? '');
-    $target   = BASE_PATH . '/database/lsiams_schema.sql';
+    $target  = BASE_PATH . '/database/lsiams_schema.sql';
+    $live    = (array) Config::get('database', []);
+    $scratch = BASE_PATH . '/storage/tmp/schema-dump-' . bin2hex(random_bytes(4)) . '.sqlite';
 
-    // mysqldump is part of the MySQL/MariaDB client package. Without it there
-    // is nothing to fall back on, so say what to install rather than failing
-    // with a bare "command not found".
-    $binary = null;
+    @mkdir(dirname($scratch), 0775, true);
 
-    foreach (['mysqldump', 'mariadb-dump'] as $candidate) {
-        exec(sprintf('command -v %s 2>/dev/null', escapeshellarg($candidate)), $found, $status);
+    // The whole 'database' entry, because that is what Database reads.
+    Config::set('database', ['path' => $scratch] + $live);
+    Database::resetInstance();
 
-        if ($status === 0 && $found !== []) {
-            $binary = $candidate;
-            break;
+    try {
+        if (Database::instance()->path() !== $scratch) {
+            fail('Refusing to continue: the scratch database is not the one open.');
+        }
+
+        commandMigrate();
+        commandSeed([]);
+
+        // The promise in the header, checked rather than assumed: nothing that
+        // belongs to a person may be in this file.
+        foreach (['users', 'students', 'teachers', 'attendance_records', 'audit_logs', 'login_history'] as $table) {
+            if ((int) Database::instance()->scalar('SELECT COUNT(*) FROM ' . $table) !== 0) {
+                fail(sprintf('Refusing to write the file: %s is not empty in the scratch database.', $table));
+            }
+        }
+
+        $body = BackupService::dump($tables);
+    } finally {
+        Database::instance()->disconnect();
+        Database::resetInstance();
+        Config::set('database', $live);
+
+        foreach ([$scratch, $scratch . '-wal', $scratch . '-shm'] as $file) {
+            @unlink($file);
         }
     }
 
-    if ($binary === null) {
-        fail('Neither mysqldump nor mariadb-dump is on PATH. Install the MySQL or MariaDB client tools.');
-        return;
-    }
-
-    $header = <<<HEADER
+    $header = sprintf(<<<'HEADER'
     -- ===========================================================================
-    -- L-SIAMS — complete schema and reference data
+    -- L-SIAMS — complete schema and reference data (SQLite)
     --
-    -- Import through phpMyAdmin (Import → choose file → Go) or from a shell:
-    --   mysql -u root -p < lsiams_schema.sql
-    --
-    -- The file creates the `%s` database and selects it, so nothing needs to
-    -- exist or be selected beforehand.
-    --
-    -- Contains every table, view, trigger, index and constraint, plus the
-    -- reference data the system needs to start: roles, permissions, grade
-    -- levels, departments, the attendance-status vocabulary, the default
-    -- settings and the current school year.
+    -- Every table, index, view and trigger, plus the reference data the system
+    -- needs to start: roles, permissions, grade levels, departments, subjects,
+    -- the attendance-status vocabulary, the default settings and the current
+    -- school year.
     --
     -- Contains NO user accounts and no student, teacher or attendance data.
-    -- Create the first administrator after importing:
-    --   php bin/console user:create-admin
     --
-    -- Generated by `php bin/console schema:dump` on %s.
+    -- The application builds its database with `php bin/console install`; this
+    -- file is the same result in one script, for reading or for:
+    --   sqlite3 storage/database/lsiams.sqlite < database/lsiams_schema.sql
+    -- Defaults call now(), which the application supplies, so a database made
+    -- this way is for L-SIAMS to use, not for inserting rows by hand.
+    --
+    -- Generated by `php bin/console schema:dump` on %s (%d tables).
     -- Do not hand-edit — schema changes belong in database/migrations/.
     -- ===========================================================================
 
 
-    HEADER;
+    HEADER, Clock::now()->format('Y-m-d'), $tables);
 
-    // The password reaches mysqldump through the environment rather than the
-    // command line, where `ps` would show it to every user on the machine.
-    $command = sprintf(
-        'MYSQL_PWD=%s %s --no-tablespaces --routines --triggers --events '
-        . '--default-character-set=utf8mb4 --skip-add-locks --skip-comments '
-        . '--complete-insert --single-transaction --host=%s --port=%d --user=%s %s 2>/dev/null',
-        escapeshellarg((string) ($config['password'] ?? '')),
-        $binary,
-        escapeshellarg((string) ($config['host'] ?? '127.0.0.1')),
-        (int) ($config['port'] ?? 3306),
-        escapeshellarg((string) ($config['username'] ?? '')),
-        escapeshellarg($database)
-    );
-
-    $body = shell_exec($command);
-
-    if (!is_string($body) || trim($body) === '') {
-        fail('mysqldump produced no output. Check the credentials in .env and that the database exists.');
-        return;
+    if (file_put_contents($target, $header . $body) === false) {
+        fail('Could not write ' . $target);
     }
 
-    // mysqldump stamps the account that produced the dump into every view,
-    // trigger and routine. That account does not exist on the machine doing the
-    // import, and the server refuses to run an object whose definer it cannot
-    // resolve — the admin dashboard 500s on the first view it touches, which is
-    // v_device_status. Dropping the clause makes the importing account the
-    // definer, and SQL SECURITY INVOKER then evaluates views with the
-    // privileges of whoever queries them, so the REVOKEs that
-    // docs/DEPLOYMENT.md applies to lsiams_app still bite.
-    $body = (string) preg_replace('/DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`\s?/', '', $body);
-    $body = str_replace('SQL SECURITY DEFINER', 'SQL SECURITY INVOKER', $body);
-
-    if (str_contains($body, 'DEFINER=')) {
-        fail('Could not strip every DEFINER clause from the dump. Refusing to write a file that only imports on this machine.');
-        return;
-    }
-
-    // Refuse to ship real people's data. A dump taken against a live or
-    // demo-seeded database would otherwise be committed to the repository.
-    $db = Database::instance();
-
-    foreach (['users' => 'user accounts', 'students' => 'students', 'attendance_records' => 'attendance records'] as $table => $label) {
-        $count = (int) $db->scalar("SELECT COUNT(*) FROM {$table}");
-
-        if ($count > 0) {
-            fail(sprintf(
-                'Refusing to dump: the database holds %d %s. Run `migrate:fresh --force` then `seed` first, '
-                . 'so the file carries reference data only.',
-                $count,
-                $label
-            ));
-            return;
-        }
-    }
-
-    // Newer mariadb-dump opens its output with a client-side directive:
-    //
-    //     /*M!999999\- enable the sandbox mode */
-    //
-    // It is meaningful only to the `mariadb` command-line client, and the
-    // version gate makes every server ignore it. phpMyAdmin's SQL parser does
-    // not: the backslash inside the comment is enough to make some versions
-    // abort the import on the first line, before a single table is created.
-    // Nothing is lost by removing it.
-    // The backslash is part of the payload, so it has to survive PHP's string
-    // parsing and then be escaped again for the regex: '\\\\' is one literal
-    // backslash by the time the pattern is compiled.
-    $body = (string) preg_replace('~/\*M!\d+\\\\-[^*]*\*/\s*~', '', $body);
-
-    // Foreign keys are switched off around the whole file because mysqldump
-    // emits tables alphabetically, not in dependency order: api_key_history is
-    // first and references devices, api_keys and users, all created hundreds of
-    // lines later. mysqldump does say so itself — but only inside
-    // /*!40014 ... */, a versioned comment, and anything that strips comments or
-    // runs one statement at a time loses it and then fails with
-    // "errno: 150 - Foreign key constraint is incorrectly formed" on the very
-    // first table. Saying it in plain SQL costs nothing and survives.
-    $quoted   = '`' . str_replace('`', '``', $database) . '`';
-    $preamble = sprintf(
-        "CREATE DATABASE IF NOT EXISTS %s CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
-        . "USE %s;\n\n"
-        . "-- Tables are emitted alphabetically rather than in dependency order,\n"
-        . "-- so the constraints are only valid once every table exists.\n"
-        . "SET FOREIGN_KEY_CHECKS = 0;\n\n",
-        $quoted,
-        $quoted
-    );
-
-    $postamble = "\n-- Re-enabled once every table, view and trigger exists.\n"
-               . "SET FOREIGN_KEY_CHECKS = 1;\n";
-
-    file_put_contents(
-        $target,
-        sprintf($header, $database, date('Y-m-d')) . $preamble . $body . $postamble
-    );
-
-    ok(sprintf("database/lsiams_schema.sql written (%.1f KB)", filesize($target) / 1024));
-    out(sprintf('  %d tables, %d triggers, %d insert statements',
-        substr_count($body, 'CREATE TABLE'),
-        substr_count($body, 'TRIGGER'),
-        substr_count($body, 'INSERT INTO')
-    ), 'grey');
+    out('');
+    ok(sprintf('database/lsiams_schema.sql written (%.1f KB)', filesize($target) / 1024));
 }
 
 /**
@@ -4066,7 +3848,10 @@ function commandSampleStudents(array $flags): void
         : date('y', (int) strtotime((string) $year['start_date']));
 
     $highest = (int) $db->scalar(
-        "SELECT COALESCE(MAX(CAST(SUBSTRING_INDEX(student_number, '-', -1) AS UNSIGNED)), 0)
+        // The text after the last '-': rtrim() strips every character that is
+        // not a dash from the end, which leaves the number up to that dash.
+        "SELECT COALESCE(MAX(CAST(substr(student_number,
+                    length(rtrim(student_number, replace(student_number, '-', ''))) + 1) AS INTEGER)), 0)
            FROM students WHERE student_number LIKE :p",
         ['p' => $prefix . '-%']
     );

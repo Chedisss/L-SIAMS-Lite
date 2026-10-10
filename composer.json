@@ -6,7 +6,7 @@
     "require": {
         "php": ">=8.1",
         "ext-pdo": "*",
-        "ext-pdo_mysql": "*",
+        "ext-pdo_sqlite": "*",
         "ext-json": "*",
         "ext-openssl": "*",
         "ext-mbstring": "*",

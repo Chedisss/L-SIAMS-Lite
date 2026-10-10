@@ -27,7 +27,8 @@ declare(strict_types=1);
  *   php bin/env-check.php tls         prints APP_URL and exits 1 when it is
  *                                     https, which the built-in server cannot
  *                                     serve
- *   php bin/env-check.php database    exits 0 if the database answers
+ *   php bin/env-check.php database    exits 0 if the database file opens and has
+ *                                     its tables; 3 if there is no file yet
  *
  * Kept free of the framework except where the check itself needs it: a
  * launcher that cannot boot the application still has to be able to say why.
@@ -43,7 +44,7 @@ switch ($command) {
     case 'required':
     case 'optional':
         $needed = $command === 'required'
-            ? ['pdo_mysql', 'openssl', 'mbstring', 'json']
+            ? ['pdo_sqlite', 'openssl', 'mbstring', 'json']
             // zip was here until the ZIP container was implemented in plain
             // PHP; nothing needs the extension now.
             : ['gd'];
@@ -130,79 +131,34 @@ switch ($command) {
         exit(0);
 
     case 'database':
-        // Probed at the socket before PDO is allowed near it.
-        //
-        // PDO::ATTR_TIMEOUT bounds the TCP connect and nothing after it, so a
-        // port that accepts the connection and then never sends MySQL's
-        // greeting leaves PDO blocked on a read with no timeout at all. That
-        // is not hypothetical: it is exactly what "Checking the database..."
-        // sitting there forever looks like, and it survives minutes of waiting
-        // because nothing in the stack has agreed to give up.
-        //
-        // A raw socket with an explicit read timeout can give up, and can tell
-        // the three failures apart — nothing listening, something listening
-        // that is not MySQL, and MySQL answering but refusing us.
-        $host    = null;
-        $port    = 3306;
-        $timeout = 5;
-
+        // The database is a file in this folder, so there is no server to be
+        // stopped and nothing to wait for. Three answers:
+        //   0  it opens and has its tables
+        //   3  there is no file yet — a new installation, or one that has not
+        //      been brought over from MariaDB — which start.bat explains
+        //   2  the file is there but will not open, or is not a database
         require __DIR__ . '/../bootstrap.php';
 
-        $host    = (string) App\Core\Config::get('database.host', '127.0.0.1');
-        $port    = (int) App\Core\Config::get('database.port', 3306);
-        $timeout = max(1, (int) App\Core\Config::get('database.connect_timeout', 5));
+        $path = (string) App\Core\Config::get('database.path', '');
 
-        $socket = @fsockopen($host, $port, $errno, $errstr, $timeout);
-
-        if (!is_resource($socket)) {
-            fwrite(STDERR, sprintf(
-                "Nothing is listening on %s:%d — %s\n",
-                $host,
-                $port,
-                $errstr !== '' ? $errstr : 'connection refused'
-            ));
-            fwrite(STDERR, "  Start MySQL in the XAMPP Control Panel, or correct DB_HOST/DB_PORT in .env.\n");
-            exit(2);
-        }
-
-        // MySQL speaks first. If nothing arrives inside the window, whatever is
-        // on that port is not a database, and connecting would hang.
-        stream_set_timeout($socket, $timeout);
-        $greeting = fread($socket, 1);
-        $timedOut = stream_get_meta_data($socket)['timed_out'] ?? false;
-        fclose($socket);
-
-        if ($timedOut || $greeting === '' || $greeting === false) {
-            fwrite(STDERR, sprintf(
-                "Something is listening on %s:%d but it is not MySQL — it never sent a greeting.\n",
-                $host,
-                $port
-            ));
-            fwrite(STDERR, "  Check DB_PORT in .env. XAMPP's MySQL is normally 3306.\n");
-            exit(2);
+        // Checked before opening: opening a missing SQLite file creates an
+        // empty one, and an empty file would pass for a database here.
+        if (!is_file($path)) {
+            fwrite(STDERR, 'No database file at ' . $path . PHP_EOL);
+            exit(3);
         }
 
         try {
-
-            App\Core\Database::instance()->scalar('SELECT 1');
+            App\Core\Database::instance()->scalar('SELECT COUNT(*) FROM schema_migrations');
             exit(0);
         } catch (Throwable $e) {
             // STDERR rather than STDOUT: start.bat sends both to nul and
-            // prints its own guidance, so this stays out of the launcher. But
-            // when the same command is run by hand — which is what start.bat
-            // now tells people to do when it cannot connect — the actual
-            // reason is the whole point, and hiding it left them guessing at a
-            // failure the server had already explained.
+            // prints its own guidance, so this stays out of the launcher. Run
+            // by hand, the actual reason is the whole point.
             $reason = $e->getPrevious() !== null ? $e->getPrevious()->getMessage() : $e->getMessage();
 
-            fwrite(STDERR, 'Database connection failed: ' . $reason . PHP_EOL);
-            fwrite(STDERR, sprintf(
-                '  host=%s port=%s database=%s user=%s' . PHP_EOL,
-                (string) App\Core\Config::get('database.host', '?'),
-                (string) App\Core\Config::get('database.port', '?'),
-                (string) App\Core\Config::get('database.database', '?'),
-                (string) App\Core\Config::get('database.username', '?')
-            ));
+            fwrite(STDERR, 'The database file would not open: ' . $reason . PHP_EOL);
+            fwrite(STDERR, '  file=' . $path . PHP_EOL);
 
             exit(2);
         }

@@ -14,11 +14,14 @@ use Throwable;
 /**
  * Database backup, verification and restore (Part 6).
  *
- * The dump is produced in PHP rather than by shelling out to mysqldump, so the
- * feature works identically on Windows Server and Linux and needs no shell
- * access from the web user. Archives are gzipped and then encrypted with
- * AES-256-GCM, because a backup file is a complete copy of every attendance
- * record and every password hash in the school.
+ * The dump is plain SQL produced in PHP from the SQLite file: every table,
+ * index, view and trigger as SQLite stored it, and every row. It is written
+ * while the system runs — a read transaction sees one consistent moment and
+ * blocks no terminal — and restored inside a single transaction, so a restore
+ * that fails part-way leaves the database exactly as it was. Archives are
+ * gzipped and then encrypted with AES-256-GCM, because a backup file is a
+ * complete copy of every attendance record and every password hash in the
+ * school.
  */
 final class BackupService
 {
@@ -128,116 +131,157 @@ final class BackupService
         }
     }
 
-    /** Produce a restorable SQL dump of the whole schema and its data. */
-    private static function dump(?int &$tableCount = null): string
+    /**
+     * Produce a restorable SQL dump of the whole schema and its data.
+     *
+     * Tables first, each followed by its rows, then indexes and views, and
+     * triggers last. Created any earlier, the triggers would fire on the
+     * INSERTs above them — refusing rows the guards exist to protect and
+     * stamping updated_at on every restored row. They are not optional
+     * decoration either: the rules that make attendance, audit logs, security
+     * logs and login history undeletable are triggers, and a dump without them
+     * restores a database that silently permits what the system refuses.
+     */
+    public static function dump(?int &$tableCount = null): string
     {
-        $db     = Database::instance();
-        $tables = $db->select('SHOW FULL TABLES WHERE Table_type = "BASE TABLE"');
+        $db  = Database::instance();
+        $pdo = $db->pdo();
 
-        $sql = "-- L-SIAMS database backup\n"
-            . '-- Generated: ' . Clock::atom() . "\n"
-            . '-- Database: ' . Config::get('database.database') . "\n\n"
-            . "SET NAMES utf8mb4;\n"
-            . "SET FOREIGN_KEY_CHECKS = 0;\n"
-            . "SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO';\n\n";
+        // A read transaction: under WAL every SELECT below sees the same
+        // moment, while taps keep writing. Database::transaction() would take
+        // the write lock instead and hold up every terminal for the duration.
+        $ownTransaction = !$db->inTransaction();
 
-        $tableCount = 0;
-
-        foreach ($tables as $row) {
-            $tableName = (string) array_values($row)[0];
-            $tableCount++;
-
-            $create = $db->selectOne(sprintf('SHOW CREATE TABLE `%s`', $tableName));
-            $sql   .= sprintf("DROP TABLE IF EXISTS `%s`;\n%s;\n\n", $tableName, (string) ($create['Create Table'] ?? ''));
-
-            // Chunked so a large attendance_records table does not have to be
-            // materialised in memory all at once.
-            $offset    = 0;
-            $chunkSize = 500;
-
-            while (true) {
-                $rows = $db->select(sprintf('SELECT * FROM `%s` LIMIT %d OFFSET %d', $tableName, $chunkSize, $offset));
-
-                if ($rows === []) {
-                    break;
-                }
-
-                $columns = '`' . implode('`, `', array_keys($rows[0])) . '`';
-                $values  = [];
-
-                foreach ($rows as $record) {
-                    $cells = [];
-
-                    foreach ($record as $value) {
-                        $cells[] = match (true) {
-                            $value === null => 'NULL',
-                            is_int($value), is_float($value) => (string) $value,
-                            is_bool($value) => $value ? '1' : '0',
-                            default => $db->pdo()->quote((string) $value),
-                        };
-                    }
-
-                    $values[] = '(' . implode(', ', $cells) . ')';
-                }
-
-                $sql .= sprintf("INSERT INTO `%s` (%s) VALUES\n%s;\n", $tableName, $columns, implode(",\n", $values));
-
-                $offset += $chunkSize;
-
-                if (count($rows) < $chunkSize) {
-                    break;
-                }
-            }
-
-            $sql .= "\n";
+        if ($ownTransaction) {
+            $pdo->exec('BEGIN');
         }
 
-        // Views are recreated after the base tables they depend on exist.
-        $views = $db->select('SHOW FULL TABLES WHERE Table_type = "VIEW"');
-
-        foreach ($views as $row) {
-            $viewName = (string) array_values($row)[0];
-            $create   = $db->selectOne(sprintf('SHOW CREATE VIEW `%s`', $viewName));
-            $body     = (string) preg_replace('/\sDEFINER\s*=\s*\S+/i', '', (string) ($create['Create View'] ?? ''));
-            $sql     .= sprintf("DROP VIEW IF EXISTS `%s`;\n%s;\n\n", $viewName, $body);
-        }
-
-        // Triggers come last, after every row is already in place. Created any
-        // earlier and the INSERTs above would fire them, writing audit rows for
-        // a restore that never happened and tripping the guards that stop
-        // attendance being rewritten.
-        //
-        // They are not optional decoration: the guards that make attendance,
-        // audit logs, security logs and login history undeletable are triggers.
-        // A dump without them restores a database that silently permits what
-        // the system is built to refuse.
-        foreach ($db->select('SHOW TRIGGERS') as $row) {
-            $triggerName = (string) ($row['Trigger'] ?? '');
-
-            if ($triggerName === '') {
-                continue;
-            }
-
-            $create = $db->selectOne(sprintf('SHOW CREATE TRIGGER `%s`', $triggerName));
-            $body   = (string) ($create['SQL Original Statement'] ?? '');
-
-            if ($body === '') {
-                continue;
-            }
-
-            // DEFINER names an account that need not exist on the machine the
-            // backup is restored to, and restoring is not the moment to find
-            // that out.
-            $body = (string) preg_replace('/\sDEFINER\s*=\s*\S+/i', '', $body);
-
-            $sql .= sprintf(
-                "DROP TRIGGER IF EXISTS `%s`;\nDELIMITER \$\$\n%s\$\$\nDELIMITER ;\n\n",
-                $triggerName,
-                rtrim($body) . "\n"
+        try {
+            $objects = $db->select(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master
+                  WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+                  ORDER BY rowid"
             );
+
+            $sql = "-- L-SIAMS database backup (SQLite)\n"
+                . '-- Generated: ' . Clock::atom() . "\n"
+                . '-- Database: ' . basename($db->path()) . "\n\n";
+
+            $tableCount = 0;
+
+            foreach ($objects as $object) {
+                if ($object['type'] !== 'table') {
+                    continue;
+                }
+
+                $table = (string) $object['name'];
+                $tableCount++;
+
+                $sql .= sprintf("DROP TABLE IF EXISTS \"%s\";\n%s;\n\n", $table, (string) $object['sql']);
+                $sql .= self::dumpRows($db, $table);
+            }
+
+            // AUTOINCREMENT counters, so an id used before the backup is not
+            // handed out again after a restore.
+            if ($db->scalar("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_sequence'") !== null) {
+                $sql .= "DELETE FROM sqlite_sequence;\n";
+
+                foreach ($db->select('SELECT name, seq FROM sqlite_sequence') as $row) {
+                    $sql .= sprintf("INSERT INTO sqlite_sequence (name, seq) VALUES (%s, %d);\n", $pdo->quote((string) $row['name']), (int) $row['seq']);
+                }
+
+                $sql .= "\n";
+            }
+
+            foreach (['index', 'view', 'trigger'] as $type) {
+                foreach ($objects as $object) {
+                    if ($object['type'] === $type) {
+                        $sql .= rtrim((string) $object['sql'], "; \n") . ";\n\n";
+                    }
+                }
+            }
+        } finally {
+            if ($ownTransaction) {
+                $pdo->exec('COMMIT');
+            }
         }
 
-        return $sql . "SET FOREIGN_KEY_CHECKS = 1;\n";
+        return $sql;
+    }
+
+    /** INSERT statements for every row of one table, generated columns left out. */
+    private static function dumpRows(Database $db, string $table): string
+    {
+        $pdo     = $db->pdo();
+        $columns = [];
+        $blobs   = [];
+
+        foreach ($db->select('SELECT name, type, hidden FROM pragma_table_xinfo(:t)', ['t' => $table]) as $column) {
+            // hidden 2 and 3 are generated columns: SQLite computes them and
+            // refuses a value for them.
+            if ((int) $column['hidden'] !== 0) {
+                continue;
+            }
+
+            $columns[] = (string) $column['name'];
+
+            if (strtoupper((string) $column['type']) === 'BLOB') {
+                $blobs[(string) $column['name']] = true;
+            }
+        }
+
+        if ($columns === []) {
+            return '';
+        }
+
+        $quoted = '"' . implode('", "', $columns) . '"';
+        $out    = '';
+
+        // Chunked by rowid so a large attendance_records table is never held
+        // in memory at once, and so the walk cannot skip or repeat a row.
+        $after     = PHP_INT_MIN;
+        $chunkSize = 500;
+
+        while (true) {
+            $rows = $db->select(
+                sprintf('SELECT rowid AS __rowid, %s FROM "%s" WHERE rowid > :after ORDER BY rowid LIMIT %d', $quoted, $table, $chunkSize),
+                ['after' => $after]
+            );
+
+            if ($rows === []) {
+                break;
+            }
+
+            $values = [];
+
+            foreach ($rows as $record) {
+                $after = (int) $record['__rowid'];
+                unset($record['__rowid']);
+
+                $cells = [];
+
+                foreach ($record as $name => $value) {
+                    $cells[] = match (true) {
+                        $value === null => 'NULL',
+                        isset($blobs[$name]) => "X'" . bin2hex((string) $value) . "'",
+                        is_int($value) => (string) $value,
+                        is_float($value) => var_export($value, true),
+                        is_bool($value) => $value ? '1' : '0',
+                        default => $pdo->quote((string) $value),
+                    };
+                }
+
+                $values[] = '(' . implode(', ', $cells) . ')';
+            }
+
+            $out .= sprintf("INSERT INTO \"%s\" (%s) VALUES\n%s;\n", $table, $quoted, implode(",\n", $values));
+
+            if (count($rows) < $chunkSize) {
+                break;
+            }
+        }
+
+        return $out === '' ? '' : $out . "\n";
     }
 
     /**
@@ -315,7 +359,8 @@ final class BackupService
         try {
             $sql                   = self::unpack($payload);
             $checks['decryptable'] = true;
-            $checks['well_formed'] = str_contains($sql, 'CREATE TABLE') && str_contains($sql, 'attendance_records');
+            $checks['well_formed'] = str_contains($sql, 'CREATE TABLE') && str_contains($sql, 'attendance_records')
+                && !self::isMariaDbDump($sql);
         } catch (Throwable) {
             // Leave the flags false; the caller reports the failure.
         }
@@ -345,7 +390,7 @@ final class BackupService
      * the administrator's password (enforced in the controller) and the backup
      * must verify first. A pre-restore safety backup is taken automatically.
      *
-     * @return array{statements:int,safety_backup:string}
+     * @return array{tables:int,safety_backup:string}
      */
     public static function restore(int $backupId, int $userId): array
     {
@@ -363,26 +408,7 @@ final class BackupService
         // expensive mistake available on this page.
         $safety = self::create('manual', $userId);
 
-        $db         = Database::instance();
-        $statements = self::splitStatements($sql);
-        $executed   = 0;
-
-        $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 0');
-
-        try {
-            foreach ($statements as $statement) {
-                $trimmed = trim($statement);
-
-                if ($trimmed === '' || str_starts_with($trimmed, '--')) {
-                    continue;
-                }
-
-                $db->pdo()->exec($trimmed);
-                $executed++;
-            }
-        } finally {
-            $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 1');
-        }
+        $executed = self::replaceDatabaseWith($sql);
 
         Database::instance()->update('backups', [
             'status'      => 'restored',
@@ -396,9 +422,9 @@ final class BackupService
             'backup',
             $backupId,
             null,
-            ['statements' => $executed, 'safety_backup' => $safety['filename']],
+            ['tables' => $executed, 'safety_backup' => $safety['filename']],
             sprintf(
-                'Database restored from %s (%d statements). Safety backup %s was taken first.',
+                'Database restored from %s (%d tables). Safety backup %s was taken first.',
                 $backup['backup_name'],
                 $executed,
                 $safety['filename']
@@ -415,97 +441,80 @@ final class BackupService
             '/admin/backup'
         );
 
-        return ['statements' => $executed, 'safety_backup' => $safety['filename']];
+        return ['tables' => $executed, 'safety_backup' => $safety['filename']];
     }
 
     /**
-     * Split a dump into statements, honouring DELIMITER directives so a
-     * trigger body is not torn apart at the semicolons inside it.
+     * Swap the whole database for the contents of a dump, as one transaction.
      *
-     * @return list<string>
+     * Everything currently in the file is dropped and the dump run in its
+     * place. If any statement fails the transaction rolls back and the
+     * database is exactly as it was — a restore cannot leave a half-replaced
+     * database behind.
+     *
+     * Foreign keys are off while it runs, because the dump creates tables in
+     * file order rather than dependency order. The PRAGMAs only take effect
+     * outside a transaction, hence the order.
+     *
+     * Returns the number of tables the dump created.
      */
-    private static function splitStatements(string $sql): array
+    public static function replaceDatabaseWith(string $sql): int
     {
-        $statements = [];
-        $delimiter  = ';';
-        $segment    = '';
+        if (self::isMariaDbDump($sql)) {
+            throw new ValidationException(['file' => [
+                'This is a backup from the MariaDB version of L-SIAMS. It cannot be restored '
+                . 'into SQLite directly; import the old database with "console db:import-mysql" instead.',
+            ]]);
+        }
 
-        foreach (preg_split('/\r\n|\n|\r/', $sql) ?: [] as $line) {
-            if (preg_match('/^\s*DELIMITER\s+(\S+)\s*$/i', $line, $matches) === 1) {
-                foreach (self::scanStatements($segment, $delimiter) as $statement) {
-                    $statements[] = $statement;
+        $db  = Database::instance();
+        $pdo = $db->pdo();
+
+        $pdo->exec('PRAGMA foreign_keys = OFF');
+        $pdo->exec('PRAGMA legacy_alter_table = ON');
+
+        try {
+            return (int) $db->transaction(static function (Database $db) use ($pdo, $sql): int {
+                foreach (['view', 'trigger', 'table'] as $type) {
+                    $names = $db->select(
+                        "SELECT name FROM sqlite_master WHERE type = :type AND name NOT LIKE 'sqlite_%'",
+                        ['type' => $type]
+                    );
+
+                    foreach ($names as $row) {
+                        $pdo->exec(sprintf('DROP %s IF EXISTS "%s"', strtoupper($type), str_replace('"', '""', (string) $row['name'])));
+                    }
                 }
 
-                $segment   = '';
-                $delimiter = $matches[1];
-                continue;
-            }
+                // pdo_sqlite runs every statement in the string, in order.
+                $pdo->exec($sql);
 
-            $segment .= $line . "\n";
+                // A backup brings back exactly what it holds. Rows that were
+                // already orphaned when it was taken come back orphaned, and
+                // refusing them would make a sound backup unrestorable; they
+                // are logged so somebody can look. A damaged archive is caught
+                // long before this, by the AES-GCM tag and gzip.
+                $orphans = $db->foreignKeyViolations();
+
+                if ($orphans !== []) {
+                    Logger::warning('Restored database contains rows whose parent row is missing', ['counts' => $orphans]);
+                }
+
+                return (int) $db->scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'");
+            });
+        } finally {
+            $pdo->exec('PRAGMA legacy_alter_table = OFF');
+            $pdo->exec('PRAGMA foreign_keys = ON');
+            $db->forgetPendingMigrations();
         }
-
-        foreach (self::scanStatements($segment, $delimiter) as $statement) {
-            $statements[] = $statement;
-        }
-
-        return $statements;
     }
 
-    /**
-     * Split one delimiter run into statements, breaking only on a delimiter
-     * that is not inside a quoted string. A naive explode(';') corrupts any
-     * row containing a semicolon — an address field, for instance.
-     *
-     * @return list<string>
-     */
-    private static function scanStatements(string $sql, string $delimiter): array
+    /** A dump written by the MariaDB version, or by mysqldump / phpMyAdmin. */
+    public static function isMariaDbDump(string $sql): bool
     {
-        $statements = [];
-        $current    = '';
-        $inString   = false;
-        $quoteChar  = '';
-        $length     = strlen($sql);
+        $head = substr($sql, 0, 20000);
 
-        for ($i = 0; $i < $length; $i++) {
-            $char = $sql[$i];
-
-            if ($inString) {
-                $current .= $char;
-
-                if ($char === '\\' && $i + 1 < $length) {
-                    $current .= $sql[++$i];
-                    continue;
-                }
-
-                if ($char === $quoteChar) {
-                    $inString = false;
-                }
-
-                continue;
-            }
-
-            if ($char === "'" || $char === '"') {
-                $inString  = true;
-                $quoteChar = $char;
-                $current  .= $char;
-                continue;
-            }
-
-            if ($char === $delimiter[0] && substr($sql, $i, strlen($delimiter)) === $delimiter) {
-                $statements[] = $current;
-                $current      = '';
-                $i           += strlen($delimiter) - 1;
-                continue;
-            }
-
-            $current .= $char;
-        }
-
-        if (trim($current) !== '') {
-            $statements[] = $current;
-        }
-
-        return $statements;
+        return preg_match('/ENGINE\s*=\s*InnoDB|SET FOREIGN_KEY_CHECKS|^\s*DELIMITER\s|\/\*!40\d{3}/mi', $head) === 1;
     }
 
     /** @return array<string,mixed>|null */
