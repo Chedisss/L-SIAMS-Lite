@@ -121,6 +121,7 @@ try {
         'tls:apache'          => commandTlsApache($arguments, $flags),
         'doctor'              => commandDoctor(),
         'db:import'           => commandDbImport($arguments, $flags),
+        'db:import-mysql'     => commandDbImportMysql($arguments, $flags),
         'backup:decrypt'      => commandBackupDecrypt($arguments),
         'time:shift'          => commandTimeShift($arguments, $flags),
         'schema:dump'         => commandSchemaDump(),
@@ -174,6 +175,7 @@ function commandHelp(): void
     out('    device:unblock [device]  Show who is rate limited, and lift it (--all)');
     out('    schema:dump             Write database/lsiams_schema.sql (schema + reference data)');
     out('    db:import <file.sql>    Replace the database with a SQLite .sql dump (--force)');
+    out('    db:import-mysql         Copy the MariaDB version\'s data in (--from-file=<dump or backup>)');
     out('    backup:decrypt <file>   Turn a backup archive back into readable SQL');
     out('    time:shift ["+2 hours"]  Move the clock to test a schedule (--clear to undo)');
     out('');
@@ -331,42 +333,12 @@ function commandKeyGenerate(array $flags): void
 /** @return list<array{name:string,path:string,checksum:string}> */
 function discoverMigrations(): array
 {
-    $directory = (string) Config::get('app.paths.migrations');
-    $files     = glob($directory . '/*.sql') ?: [];
-
-    sort($files, SORT_NATURAL);
-
-    return array_map(static fn (string $path): array => [
-        'name'     => basename($path),
-        'path'     => $path,
-        'checksum' => hash_file('sha256', $path),
-    ], $files);
+    return App\Services\MigrationService::discover();
 }
 
-/**
- * Create the bookkeeping table on a new database file. Checked first rather
- * than relying on IF NOT EXISTS alone, so read-only callers such as `doctor`
- * and `migrate:status` never write to the file just by looking at it.
- */
 function ensureMigrationsTable(Database $db): void
 {
-    $exists = (int) $db->scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = :name",
-        ['name' => 'schema_migrations']
-    );
-
-    if ($exists > 0) {
-        return;
-    }
-
-    $db->pdo()->exec(
-        'CREATE TABLE IF NOT EXISTS schema_migrations (
-            migration  TEXT    NOT NULL PRIMARY KEY,
-            batch      INTEGER NOT NULL,
-            checksum   TEXT    NOT NULL,
-            applied_at TEXT    NOT NULL DEFAULT (now())
-        )'
-    );
+    App\Services\MigrationService::ensureTable($db);
 }
 
 function commandMigrate(): void
@@ -503,57 +475,10 @@ function commandMigrateRechecksum(array $flags): void
     ok(sprintf('%d checksum(s) re-recorded.', count($drifted)));
 }
 
-/**
- * Apply one migration file and record it, as a single transaction.
- *
- * SQLite runs schema changes inside a transaction like any other write, so a
- * migration either happens completely, recorded in schema_migrations, or not
- * at all — there is no half-applied state to recover from on the next run.
- *
- * Foreign keys are switched off while it runs, because several migrations
- * rebuild a table (create the new shape, copy, drop the old one, rename), and
- * with them on, dropping a table that others reference would fire their ON
- * DELETE actions. legacy_alter_table keeps a rename from rewriting the views
- * and triggers that refer to the table by name. Both have to be set outside
- * the transaction, where SQLite honours them. Before committing,
- * foreign_key_check confirms the migration broke no reference that resolved
- * before it ran; if it did, the migration is rolled back rather than leaving a
- * broken link behind.
- *
- * @param array{migration:string,batch:int,checksum:string} $record
- */
+/** @param array{migration:string,batch:int,checksum:string} $record */
 function runMigration(Database $db, string $sql, array $record): void
 {
-    $pdo = $db->pdo();
-    $pdo->exec('PRAGMA foreign_keys = OFF');
-    $pdo->exec('PRAGMA legacy_alter_table = ON');
-
-    try {
-        $db->transaction(static function (Database $db) use ($pdo, $sql, $record): void {
-            // Rows that were already orphaned before this migration — an old
-            // import done with checks off, say — are not its fault, and must
-            // not stop every future migration from running.
-            $before = $db->foreignKeyViolations();
-
-            // pdo_sqlite runs every statement in the string, triggers included.
-            $pdo->exec($sql);
-
-            $broken = Database::newViolations($before, $db->foreignKeyViolations());
-
-            if ($broken !== []) {
-                throw new RuntimeException(sprintf(
-                    'it would leave rows pointing at something that does not exist (%s).',
-                    implode(', ', array_map(static fn (string $k, int $n): string => "$n in $k", array_keys($broken), $broken))
-                ));
-            }
-
-            $db->insert('schema_migrations', $record);
-        });
-    } finally {
-        $pdo->exec('PRAGMA legacy_alter_table = OFF');
-        $pdo->exec('PRAGMA foreign_keys = ON');
-        $db->forgetPendingMigrations();
-    }
+    App\Services\MigrationService::run($db, $sql, $record);
 }
 
 function commandMigrateStatus(): void
@@ -2229,6 +2154,121 @@ function commandBackupDecrypt(array $arguments): void
     out('');
     out('  Load it with:  php bin/console db:import ' . escapeshellarg($target), 'cyan');
     out('  It contains real data — delete it once the import has worked.', 'grey');
+}
+
+/**
+ * Bring an installation's data over from the MariaDB version of L-SIAMS.
+ *
+ *   php bin/console db:import-mysql
+ *       Reads the MariaDB database the old .env points at (DB_HOST, DB_PORT,
+ *       DB_NAME, DB_USER, DB_PASS). MySQL has to be running for this one.
+ *
+ *   php bin/console db:import-mysql --from-file=<file>
+ *       Reads a dump instead, with no MariaDB needed: a phpMyAdmin export, a
+ *       mysqldump (.sql or .sql.gz), or a backup the MariaDB version made
+ *       (.sql.gz.lsiams) — decrypted with the APP_KEY in this .env, which is
+ *       why the .env has to come across from the old installation.
+ *
+ * The new database is built beside the real one and moved into place only
+ * after every table has been checked row for row; see MariaDbImporter. With
+ * --force an existing database is set aside (renamed, never deleted).
+ *
+ * @param list<string> $arguments
+ * @param list<string> $flags
+ */
+function commandDbImportMysql(array $arguments, array $flags): void
+{
+    @ini_set('memory_limit', '1024M');
+    @set_time_limit(0);
+
+    $file     = null;
+    $timeZone = null;
+
+    foreach (array_merge($arguments, $flags) as $argument) {
+        if (str_starts_with($argument, '--from-file=')) {
+            $file = substr($argument, strlen('--from-file='));
+        }
+
+        if (str_starts_with($argument, '--timezone=')) {
+            $timeZone = substr($argument, strlen('--timezone='));
+
+            if (preg_match('/^[+-]\d{2}:\d{2}$/', $timeZone) !== 1) {
+                fail('--timezone takes an offset like +00:00 or +08:00.');
+            }
+        }
+    }
+
+    heading('Importing from the MariaDB version');
+
+    try {
+        if ($file !== null && $file !== '') {
+            if (!is_file($file) && is_file(BASE_PATH . '/' . ltrim($file, '/\\'))) {
+                $file = BASE_PATH . '/' . ltrim($file, '/\\');
+            }
+
+            $source = new App\Services\Import\MariaDbDumpSource($file, $timeZone);
+        } else {
+            /** @var array{host:string,port:int,database:string,username:string,password:string} $config */
+            $config = (array) Config::get('database.mysql_source', []);
+            $source = new App\Services\Import\LiveMariaDbSource([
+                'host'     => (string) ($config['host'] ?? '127.0.0.1'),
+                'port'     => (int) ($config['port'] ?? 3306),
+                'database' => (string) ($config['database'] ?? 'lsiams_db'),
+                'username' => (string) ($config['username'] ?? 'lsiams_app'),
+                'password' => (string) ($config['password'] ?? ''),
+            ]);
+        }
+
+        $importer = new App\Services\Import\MariaDbImporter($source, static function (string $line): void {
+            out('  ' . $line, 'grey');
+        });
+
+        $started = microtime(true);
+        $report  = $importer->run((string) Config::get('database.path'), in_array('--force', $flags, true));
+    } catch (Throwable $e) {
+        out('');
+        out('  Nothing was changed.', 'yellow');
+        fail($e->getMessage());
+    }
+
+    out('');
+
+    foreach ($report['per_table'] as $table => $count) {
+        if ($count > 0) {
+            out(sprintf('  %-34s %8s', $table, number_format($count)), 'grey');
+        }
+    }
+
+    out('');
+    ok(sprintf('%s rows in %d tables copied and verified in %.1fs.', number_format($report['rows']), $report['tables'], microtime(true) - $started));
+    ok('Database: ' . $report['path']);
+
+    if ($report['migrations_after'] !== []) {
+        ok('Brought up to date with ' . count($report['migrations_after']) . ' newer migration(s).');
+    }
+
+    if ($report['previous'] !== null) {
+        out('  The database that was there before is kept as ' . basename($report['previous']), 'grey');
+    }
+
+    if ($source instanceof App\Services\Import\MariaDbDumpSource && ($note = $source->timeZoneNote()) !== null) {
+        out('');
+        out('  ' . wordwrap($note, 76, "\n  "), 'yellow');
+    }
+
+    if ($report['orphans'] !== []) {
+        out('');
+        out('  Copied as they were, but worth a look: rows whose parent row is missing', 'yellow');
+        out('  (the old database already had these; nothing here created them):', 'yellow');
+
+        foreach ($report['orphans'] as $what => $count) {
+            out(sprintf('    %d in %s', $count, $what), 'yellow');
+        }
+    }
+
+    out('');
+    out('  Next: start L-SIAMS with start.bat and sign in as before.', 'cyan');
+    out('');
 }
 
 /**
