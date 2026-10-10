@@ -230,7 +230,7 @@ final class Fixture
         ]);
 
         $this->db->execute(
-            'INSERT IGNORE INTO subject_grade_levels (subject_id, grade_level_id) VALUES (:s, :g)',
+            'INSERT OR IGNORE INTO subject_grade_levels (subject_id, grade_level_id) VALUES (:s, :g)',
             ['s' => $subjectId, 'g' => $gradeLevelId]
         );
 
@@ -247,12 +247,12 @@ final class Fixture
         ]);
 
         $this->db->execute(
-            'INSERT IGNORE INTO teacher_grade_levels (teacher_id, grade_level_id) VALUES (:t, :g)',
+            'INSERT OR IGNORE INTO teacher_grade_levels (teacher_id, grade_level_id) VALUES (:t, :g)',
             ['t' => $teacherId, 'g' => $gradeLevelId]
         );
 
         $this->db->execute(
-            'INSERT IGNORE INTO teacher_departments (teacher_id, department_id, is_primary) VALUES (:t, :d, 1)',
+            'INSERT OR IGNORE INTO teacher_departments (teacher_id, department_id, is_primary) VALUES (:t, :d, 1)',
             ['t' => $teacherId, 'd' => $departmentId]
         );
 
@@ -311,7 +311,7 @@ final class Fixture
                 $cards[$sectionId][]    = $uid;
 
                 $this->db->execute(
-                    'INSERT IGNORE INTO student_subject_enrolments
+                    'INSERT OR IGNORE INTO student_subject_enrolments
                           (student_id, subject_id, section_id, school_year_id, status, created_at, updated_at)
                      VALUES (:st, :sub, :sec, :yr, \'enrolled\', :now, :now)',
                     ['st' => $studentId, 'sub' => $subjectId, 'sec' => $sectionId, 'yr' => $year, 'now' => $now]
@@ -431,7 +431,7 @@ final class Fixture
         $db     = $this->db;
         $prefix = self::PREFIX . '%';
 
-        $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 0');
+        $db->pdo()->exec('PRAGMA foreign_keys = OFF');
 
         // Attendance history is protected by a BEFORE DELETE trigger, so test
         // rows have to be removed with the trigger temporarily out of the way.
@@ -440,24 +440,23 @@ final class Fixture
         $db->pdo()->exec('DROP TRIGGER IF EXISTS trg_attendance_no_delete');
 
         $db->execute(
-            'DELETE ar FROM attendance_records ar
-               JOIN attendance_sessions s ON s.session_id = ar.session_id
-               JOIN devices d ON d.id = s.device_row_id
-              WHERE d.device_id LIKE :prefix',
+            'DELETE FROM attendance_records
+              WHERE session_id IN (SELECT s.session_id
+                                     FROM attendance_sessions s
+                                     JOIN devices d ON d.id = s.device_row_id
+                                    WHERE d.device_id LIKE :prefix)',
             ['prefix' => $prefix]
         );
 
         $db->execute(
-            'DELETE rl FROM rfid_logs rl
-               JOIN devices d ON d.id = rl.device_row_id
-              WHERE d.device_id LIKE :prefix',
+            'DELETE FROM rfid_logs
+              WHERE device_row_id IN (SELECT id FROM devices WHERE device_id LIKE :prefix)',
             ['prefix' => $prefix]
         );
 
         $db->execute(
-            'DELETE s FROM attendance_sessions s
-               JOIN devices d ON d.id = s.device_row_id
-              WHERE d.device_id LIKE :prefix',
+            'DELETE FROM attendance_sessions
+              WHERE device_row_id IN (SELECT id FROM devices WHERE device_id LIKE :prefix)',
             ['prefix' => $prefix]
         );
 
@@ -533,30 +532,24 @@ final class Fixture
             $db->pdo()->exec(
                 "CREATE TRIGGER trg_login_history_no_delete
                  BEFORE DELETE ON login_history
-                 FOR EACH ROW
                  BEGIN
-                   SIGNAL SQLSTATE '45000'
-                     SET MESSAGE_TEXT = 'Login history is permanent and cannot be deleted.';
+                     SELECT RAISE(ABORT, 'Login history is permanent and cannot be deleted.');
                  END"
             );
 
             $db->pdo()->exec(
                 "CREATE TRIGGER trg_security_no_delete
                  BEFORE DELETE ON security_logs
-                 FOR EACH ROW
                  BEGIN
-                   SIGNAL SQLSTATE '45000'
-                     SET MESSAGE_TEXT = 'Security logs are immutable and cannot be deleted.';
+                     SELECT RAISE(ABORT, 'Security logs are immutable and cannot be deleted.');
                  END"
             );
 
             $db->pdo()->exec(
                 "CREATE TRIGGER trg_audit_no_delete
                  BEFORE DELETE ON audit_logs
-                 FOR EACH ROW
                  BEGIN
-                   SIGNAL SQLSTATE '45000'
-                     SET MESSAGE_TEXT = 'Audit logs are immutable and cannot be deleted.';
+                     SELECT RAISE(ABORT, 'Audit logs are immutable and cannot be deleted.');
                  END"
             );
         }
@@ -572,14 +565,12 @@ final class Fixture
         $db->pdo()->exec(
             "CREATE TRIGGER trg_attendance_no_delete
              BEFORE DELETE ON attendance_records
-             FOR EACH ROW
              BEGIN
-               SIGNAL SQLSTATE '45000'
-                 SET MESSAGE_TEXT = 'Attendance records are permanent and cannot be deleted. Use an administrator correction instead.';
+                 SELECT RAISE(ABORT, 'Attendance records are permanent and cannot be deleted. Use an administrator correction instead.');
              END"
         );
 
-        $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 1');
+        $db->pdo()->exec('PRAGMA foreign_keys = ON');
     }
 }
 
@@ -855,7 +846,7 @@ try {
 
         // Move the recorded time-in back so the dwell requirement is satisfied.
         $db->execute(
-            'UPDATE attendance_records SET time_in = DATE_SUB(time_in, INTERVAL 40 MINUTE)
+            'UPDATE attendance_records SET time_in = datetime(time_in, \'-40 minutes\')
               WHERE session_id = :s AND student_id = :st',
             ['s' => $session['session_id'], 'st' => $studentId]
         );
@@ -948,7 +939,7 @@ try {
         }
 
         $db->execute(
-            'UPDATE attendance_records SET time_in = DATE_SUB(time_in, INTERVAL 40 MINUTE)
+            'UPDATE attendance_records SET time_in = datetime(time_in, \'-40 minutes\')
               WHERE session_id = :s',
             ['s' => $session['session_id']]
         );
@@ -1564,7 +1555,7 @@ try {
         // next open is genuinely the first of its day for this section.
         $db->execute(
             "UPDATE attendance_sessions
-                SET session_date = DATE_SUB(session_date, INTERVAL 1 DAY),
+                SET session_date = date(session_date, '-1 day'),
                     status = 'closed'
               WHERE section_id = :section",
             ['section' => (int) $fixture->ids['sections'][0]]
@@ -3763,7 +3754,7 @@ try {
         $db->execute("UPDATE schedules SET status = 'archived', deleted_at = NOW() WHERE subject_id = :i",
             ['i' => $scheduled]);
         $db->execute(
-            'INSERT IGNORE INTO teacher_subjects (teacher_id, subject_id, is_exception) VALUES (:t, :s, 1)',
+            'INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_id, is_exception) VALUES (:t, :s, 1)',
             ['t' => (int) $fixture->ids['teacher_id'], 's' => $scheduled]
         );
 
@@ -3831,7 +3822,7 @@ try {
         // Who teaches this. The Subjects page showed a count and nothing else,
         // so "3" meant going to Teachers, filtering, and reading down a list.
         $db->execute(
-            'INSERT IGNORE INTO teacher_subjects (teacher_id, subject_id, is_exception) VALUES (:t, :s, 1)',
+            'INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_id, is_exception) VALUES (:t, :s, 1)',
             ['t' => (int) $fixture->ids['teacher_id'], 's' => $scheduled]
         );
 

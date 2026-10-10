@@ -183,18 +183,18 @@ final class App
             if ($request->wantsJson()) {
                 return Response::fail(
                     'DATABASE_UNAVAILABLE',
-                    'The database is not responding. It is usually not running.',
+                    'The database file could not be opened.',
                     503
                 );
             }
 
             return $this->errorPage(
                 503,
-                'The database is not running',
-                'Every page needs it, so nothing will load until it is started. '
-                . 'On a development machine: open the XAMPP Control Panel and press Start next to '
-                . 'MySQL, then reload this page. If it starts and immediately stops, run '
-                . 'mysql-doctor.bat in the project folder — it reports why.'
+                'The database file could not be opened',
+                'Every page needs it, so nothing will load until it opens. '
+                . 'Check that storage\\database\\lsiams.sqlite exists and is not read-only, '
+                . 'and that the folder has not been moved or restored from a broken copy. '
+                . 'Run doctor.bat in the project folder — it checks the file and says what is wrong.'
             );
         }
 
@@ -268,18 +268,15 @@ final class App
     /**
      * Is this failure "the database is not there" rather than a bug?
      *
-     * Matched on the driver's own codes rather than on message text, which is
-     * localised and version-dependent:
+     * Matched on SQLite's own result codes rather than on message text:
      *
-     *   2002  cannot connect - nothing listening, or the socket is wrong
-     *   2003  cannot connect - host unreachable
-     *   2006  server has gone away - it died mid-query
-     *   2013  lost connection during the query
-     *   1040  too many connections
-     *   1045  access denied - the credentials no longer work
+     *   14  SQLITE_CANTOPEN - the file or its folder cannot be opened
+     *   26  SQLITE_NOTADB   - the file is not a database (a bad copy)
+     *   11  SQLITE_CORRUPT  - the file is damaged
+     *    8  SQLITE_READONLY - the file or folder is read-only to this process
      *
-     * The connect path wraps PDOException in a RuntimeException so the DSN
-     * cannot leak, so the cause has to be unwrapped to be read.
+     * The connect path wraps PDOException in a RuntimeException, so the cause
+     * has to be unwrapped to be read.
      */
     private static function isDatabaseUnavailable(Throwable $e): bool
     {
@@ -290,7 +287,7 @@ final class App
 
             $driverCode = (int) ($cause->errorInfo[1] ?? 0);
 
-            if (in_array($driverCode, [2002, 2003, 2006, 2013, 1040, 1045], true)) {
+            if (in_array($driverCode, [14, 26, 11, 8], true)) {
                 return true;
             }
 

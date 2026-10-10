@@ -28,7 +28,7 @@ return static function (Database $db): void {
         $db->execute(
             'INSERT INTO roles (role_slug, role_name, description, is_system, status)
                   VALUES (:slug, :name, :description, :system, :status)
-             ON DUPLICATE KEY UPDATE description = VALUES(description)',
+             ON CONFLICT (role_slug) DO UPDATE SET description = excluded.description',
             [
                 'slug'        => $slug,
                 'name'        => $name,
@@ -63,7 +63,7 @@ return static function (Database $db): void {
     foreach ($permissions as $module => $actions) {
         foreach ($actions as $action) {
             $db->execute(
-                'INSERT IGNORE INTO permissions (permission_key, module, description)
+                'INSERT OR IGNORE INTO permissions (permission_key, module, description)
                       VALUES (:key, :module, :description)',
                 [
                     'key'         => $module . '.' . $action,
@@ -79,7 +79,7 @@ return static function (Database $db): void {
 
     // Administrators hold everything.
     $db->execute(
-        'INSERT IGNORE INTO role_permissions (role_id, permission_id)
+        'INSERT OR IGNORE INTO role_permissions (role_id, permission_id)
          SELECT :role, permission_id FROM permissions',
         ['role' => $administratorId]
     );
@@ -98,7 +98,7 @@ return static function (Database $db): void {
 
     foreach ($teacherPermissions as $key) {
         $db->execute(
-            'INSERT IGNORE INTO role_permissions (role_id, permission_id)
+            'INSERT OR IGNORE INTO role_permissions (role_id, permission_id)
              SELECT :role, permission_id FROM permissions WHERE permission_key = :key',
             ['role' => $teacherId, 'key' => $key]
         );
@@ -118,7 +118,7 @@ return static function (Database $db): void {
         $db->execute(
             'INSERT INTO grade_levels (grade_level_code, grade_level_name, numeric_level, track, status)
                   VALUES (:code, :name, :numeric, :track, \'active\')
-             ON DUPLICATE KEY UPDATE grade_level_name = VALUES(grade_level_name)',
+             ON CONFLICT (grade_level_code) DO UPDATE SET grade_level_name = excluded.grade_level_name',
             ['code' => $code, 'name' => $name, 'numeric' => $numeric, 'track' => $track]
         );
     }
@@ -143,7 +143,7 @@ return static function (Database $db): void {
         $db->execute(
             'INSERT INTO departments (department_code, department_name, description, status)
                   VALUES (:code, :name, :description, \'active\')
-             ON DUPLICATE KEY UPDATE description = VALUES(description)',
+             ON CONFLICT (department_code) DO UPDATE SET description = excluded.description',
             ['code' => $code, 'name' => $name, 'description' => $description]
         );
     }
@@ -173,7 +173,7 @@ return static function (Database $db): void {
         $db->execute(
             'INSERT INTO attendance_status (status_key, label, category, badge_class, counts_as_present, sort_order)
                   VALUES (:key, :label, :category, :badge, :counts, :sort)
-             ON DUPLICATE KEY UPDATE label = VALUES(label), badge_class = VALUES(badge_class)',
+             ON CONFLICT (status_key) DO UPDATE SET label = excluded.label, badge_class = excluded.badge_class',
             [
                 'key' => $key, 'label' => $label, 'category' => $category,
                 'badge' => $badge, 'counts' => $countsPresent, 'sort' => $order,
@@ -232,14 +232,14 @@ return static function (Database $db): void {
         $db->execute(
             'INSERT INTO settings (setting_key, setting_value, value_type, group_name, label, description, is_sensitive, min_value, max_value)
                   VALUES (:key, :value, :type, :group, :label, :description, :sensitive, :min, :max)
-             ON DUPLICATE KEY UPDATE
-                  label = VALUES(label),
-                  description = VALUES(description),
-                  value_type = VALUES(value_type),
-                  group_name = VALUES(group_name),
-                  is_sensitive = VALUES(is_sensitive),
-                  min_value = VALUES(min_value),
-                  max_value = VALUES(max_value)',
+             ON CONFLICT (setting_key) DO UPDATE SET
+                  label = excluded.label,
+                  description = excluded.description,
+                  value_type = excluded.value_type,
+                  group_name = excluded.group_name,
+                  is_sensitive = excluded.is_sensitive,
+                  min_value = excluded.min_value,
+                  max_value = excluded.max_value',
             [
                 'key' => $key, 'value' => $value, 'type' => $type, 'group' => $group,
                 'label' => $label, 'description' => $description,
@@ -259,7 +259,7 @@ return static function (Database $db): void {
     $db->execute(
         'INSERT INTO school_years (year_label, start_date, end_date, is_current, status)
               VALUES (:label, :start, :end, 1, \'active\')
-         ON DUPLICATE KEY UPDATE is_current = 1, status = \'active\'',
+         ON CONFLICT (year_label) DO UPDATE SET is_current = 1, status = \'active\'',
         [
             'label' => $label,
             'start' => $startYear . '-06-01',

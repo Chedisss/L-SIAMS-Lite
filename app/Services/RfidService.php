@@ -158,7 +158,7 @@ final class RfidService
             // uq_one_active_card_per_student would reject a second active row
             // regardless, but doing it explicitly gives a clean history chain.
             $current = $db->selectOne(
-                "SELECT * FROM rfid_cards WHERE student_id = :student AND status = 'active' FOR UPDATE",
+                "SELECT * FROM rfid_cards WHERE student_id = :student AND status = 'active'",
                 ['student' => $studentId]
             );
 
@@ -621,7 +621,7 @@ final class RfidService
             $db->execute(
                 "INSERT INTO rfid_cards (card_uid, issue_date, status, notes, issued_by, created_at, updated_at)
                       VALUES (:uid, :today, 'blacklisted', :notes, :user, :now, :now)
-                 ON DUPLICATE KEY UPDATE status = 'blacklisted', notes = VALUES(notes), updated_at = VALUES(updated_at)",
+                 ON CONFLICT (card_uid) DO UPDATE SET status = 'blacklisted', notes = excluded.notes, updated_at = excluded.updated_at",
                 [
                     'uid'   => (string) $unknown['card_uid'],
                     'today' => Clock::today(),

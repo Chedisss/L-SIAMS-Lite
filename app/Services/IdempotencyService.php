@@ -77,7 +77,7 @@ final class IdempotencyService
         $hours = $hours ?? (int) Config::get('security.request.idempotency_retention_hours', 24);
 
         return Database::instance()->execute(
-            'DELETE FROM processed_requests WHERE created_at < DATE_SUB(NOW(), INTERVAL :hours HOUR)',
+            'DELETE FROM processed_requests WHERE created_at < datetime(NOW(), \'-\' || :hours || \' hours\')',
             ['hours' => $hours]
         );
     }

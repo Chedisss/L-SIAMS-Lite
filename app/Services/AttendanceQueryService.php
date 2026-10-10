@@ -154,7 +154,7 @@ final class AttendanceQueryService
 
         $db->transaction(static function (Database $db) use ($attendanceId, $changes, $reason, $administratorId): void {
             $record = $db->selectOne(
-                'SELECT * FROM attendance_records WHERE attendance_id = :id FOR UPDATE',
+                'SELECT * FROM attendance_records WHERE attendance_id = :id',
                 ['id' => $attendanceId]
             );
 

@@ -14,8 +14,12 @@ use Throwable;
  *
  * Every query in L-SIAMS goes through here, and every one of them is a prepared
  * statement — there is no method on this class that accepts interpolated user
- * input. Transaction helpers implement the deadlock-retry policy from Part 17.2
- * so callers never have to reason about MySQL error 1213 themselves.
+ * input. Transaction helpers implement the retry policy from Part 17.2 so
+ * callers never have to reason about a busy database themselves.
+ *
+ * The store is a single SQLite file (config/database.php). One connection
+ * writes at a time; see beginTransaction() for how that stands in for the row
+ * locks the MariaDB version took.
  */
 final class Database
 {
@@ -56,64 +60,47 @@ final class Database
             return $this->pdo;
         }
 
-        $dsn = sprintf(
-            'mysql:host=%s;port=%d;dbname=%s;charset=%s',
-            (string) $this->config['host'],
-            (int) $this->config['port'],
-            (string) $this->config['database'],
-            (string) $this->config['charset']
-        );
-
-        $isolation = (string) ($this->config['options']['isolation'] ?? 'READ-COMMITTED');
-        $sqlMode   = (string) ($this->config['options']['sql_mode'] ?? 'STRICT_ALL_TABLES');
+        $path = $this->path();
 
         $options = [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            // Real prepared statements: the server never sees a concatenated
-            // query, which is what actually stops SQL injection.
-            PDO::ATTR_EMULATE_PREPARES   => false,
             PDO::ATTR_STRINGIFY_FETCHES  => false,
-            PDO::ATTR_PERSISTENT         => (bool) ($this->config['persistent'] ?? false),
-            // Bounded, because the unbounded default is not a timeout at all —
-            // it is the operating system's, and a host that accepts the SYN and
-            // then says nothing leaves the process waiting minutes with no
-            // output. That is what a launcher sitting on "Checking the
-            // database..." forever actually is. Failing in seconds turns it
-            // into a message somebody can act on.
-            PDO::ATTR_TIMEOUT            => max(1, (int) ($this->config['connect_timeout'] ?? 5)),
-            // Only assignable system variables belong here. The isolation level
-            // is set separately below: `SET SESSION TRANSACTION ISOLATION LEVEL`
-            // is its own statement form and cannot be comma-chained with
-            // variable assignments, and the variable that would express it is
-            // spelled differently across MySQL and MariaDB versions.
-            PDO::MYSQL_ATTR_INIT_COMMAND => sprintf(
-                "SET SESSION sql_mode='%s', time_zone='%s'",
-                $sqlMode,
-                self::mysqlTimezoneOffset()
-            ),
+            // pdo_sqlite reads this as the busy timeout, in seconds. The
+            // PRAGMA below sets the same thing to the millisecond.
+            PDO::ATTR_TIMEOUT            => max(1, intdiv($this->busyTimeoutMs(), 1000)),
         ];
 
         try {
-            $this->pdo = new PDO(
-                $dsn,
-                (string) $this->config['username'],
-                (string) $this->config['password'],
-                $options
-            );
+            $directory = dirname($path);
 
-            // READ COMMITTED is a correctness requirement, not a preference:
-            // the tap engine takes explicit row locks in a fixed order, and
-            // REPEATABLE READ would add gap locks that turn concurrent taps on
-            // adjacent students into avoidable lock waits. A connection that
-            // could not be set to it must not be handed out.
-            $this->pdo->exec(sprintf(
-                'SET SESSION TRANSACTION ISOLATION LEVEL %s',
-                self::isolationClause($isolation)
-            ));
+            if (!is_dir($directory) && !@mkdir($directory, 0775, true) && !is_dir($directory)) {
+                throw new RuntimeException('The database folder could not be created: ' . $directory);
+            }
+
+            // PDO::connect() hands back the driver subclass on PHP 8.4+, which
+            // is where createFunction() lives; older versions only have the
+            // sqliteCreateFunction() spelling on plain PDO.
+            $this->pdo = method_exists(PDO::class, 'connect')
+                ? PDO::connect('sqlite:' . $path, null, null, $options)
+                : new PDO('sqlite:' . $path, null, null, $options);
+
+            // WAL lets every reader carry on while one connection writes, which
+            // is what keeps the dashboard, the realtime server and the worker
+            // from queueing behind a tap. It is a property of the file and
+            // survives reconnects; asking again is cheap.
+            $this->pdo->exec('PRAGMA journal_mode = WAL');
+            // NORMAL is the documented safe setting under WAL: a power cut can
+            // lose the last moments of commits but never corrupts the file.
+            $this->pdo->exec('PRAGMA synchronous = NORMAL');
+            // SQLite ships with foreign keys off, per connection. Every
+            // relationship in the schema depends on them being enforced.
+            $this->pdo->exec('PRAGMA foreign_keys = ON');
+            $this->pdo->exec('PRAGMA busy_timeout = ' . $this->busyTimeoutMs());
+
+            self::registerFunctions($this->pdo);
         } catch (PDOException $e) {
-            // The DSN carries the credentials; never let it reach a log or a page.
-            Logger::critical('Database connection failed', ['code' => $e->getCode()]);
+            Logger::critical('Database connection failed', ['code' => $e->getCode(), 'path' => $path]);
             $this->pdo = null;
             throw new RuntimeException('Database connection failed.', 0, $e);
         }
@@ -121,31 +108,124 @@ final class Database
         return $this->pdo;
     }
 
-    /**
-     * Map a configured isolation level onto the SQL clause spelling.
-     *
-     * Allowlisted rather than interpolated: this value reaches the server
-     * inside a statement that cannot be parameterised, so an unrecognised
-     * setting falls back to the safe default instead of being passed through.
-     */
-    private static function isolationClause(string $isolation): string
+    /** Absolute path of the SQLite file this installation uses. */
+    public function path(): string
     {
-        return match (strtoupper(str_replace([' ', '_'], '-', trim($isolation)))) {
-            'READ-UNCOMMITTED' => 'READ UNCOMMITTED',
-            'REPEATABLE-READ'  => 'REPEATABLE READ',
-            'SERIALIZABLE'     => 'SERIALIZABLE',
-            default            => 'READ COMMITTED',
-        };
+        return (string) ($this->config['path'] ?? '');
     }
 
-    private static function mysqlTimezoneOffset(): string
+    /** Close the file, so it can be copied or replaced. Reopens on next use. */
+    public function disconnect(): void
     {
-        $tz     = new \DateTimeZone((string) Config::get('app.timezone', 'UTC'));
-        $offset = $tz->getOffset(new \DateTimeImmutable('now', $tz));
-        $sign   = $offset < 0 ? '-' : '+';
-        $offset = abs($offset);
+        $this->pdo              = null;
+        $this->transactionDepth = 0;
+        $this->columnCache      = null;
+    }
 
-        return sprintf('%s%02d:%02d', $sign, intdiv($offset, 3600), intdiv($offset % 3600, 60));
+    private function busyTimeoutMs(): int
+    {
+        return max(100, (int) ($this->config['busy_timeout_ms'] ?? 5000));
+    }
+
+    /**
+     * The handful of MySQL functions the application's SQL still speaks.
+     *
+     * NOW() and CURDATE() are the important two. SQLite's own CURRENT_TIMESTAMP
+     * is UTC, while every stored time in L-SIAMS is local time in
+     * APP_TIMEZONE, exactly as MariaDB's NOW() returned it with the session
+     * time zone the old connection set. Real time is used, not Clock::now():
+     * MariaDB's NOW() never honoured a frozen or shifted application clock
+     * either, and code that needs that clock passes it in as a parameter.
+     *
+     * The rest keep queries readable without rewriting them: CONCAT() is NULL
+     * if any argument is (as in MySQL, and unlike a bare ||), FIELD() gives an
+     * enum its declared sort order, and TIMESTAMPDIFF() takes its unit as a
+     * quoted string because SQLite would read a bare SECOND as a column name.
+     */
+    public static function registerFunctions(PDO $pdo): void
+    {
+        $register = static function (string $name, callable $fn, int $args, bool $deterministic) use ($pdo): void {
+            $flags = $deterministic ? PDO::SQLITE_DETERMINISTIC : 0;
+
+            if (method_exists($pdo, 'createFunction')) {
+                $pdo->createFunction($name, $fn, $args, $flags);
+            } else {
+                $pdo->sqliteCreateFunction($name, $fn, $args, $flags);
+            }
+        };
+
+        $register('now', static fn (): string => Clock::real()->format('Y-m-d H:i:s'), 0, false);
+        $register('curdate', static fn (): string => Clock::real()->format('Y-m-d'), 0, false);
+
+        $register('concat', static function (mixed ...$parts): ?string {
+            foreach ($parts as $part) {
+                if ($part === null) {
+                    return null;
+                }
+            }
+
+            return implode('', array_map(static fn (mixed $p): string => (string) $p, $parts));
+        }, -1, true);
+
+        $register('field', static function (mixed $needle, mixed ...$list): int {
+            if ($needle === null) {
+                return 0;
+            }
+
+            foreach ($list as $index => $candidate) {
+                if ($candidate !== null && strcasecmp((string) $candidate, (string) $needle) === 0) {
+                    return $index + 1;
+                }
+            }
+
+            return 0;
+        }, -1, true);
+
+        $register('timestampdiff', static function (mixed $unit, mixed $from, mixed $to): ?int {
+            if ($from === null || $to === null) {
+                return null;
+            }
+
+            $seconds = strtotime((string) $to . ' UTC') - strtotime((string) $from . ' UTC');
+
+            $divisor = match (strtoupper((string) $unit)) {
+                'SECOND' => 1,
+                'MINUTE' => 60,
+                'HOUR'   => 3600,
+                'DAY'    => 86400,
+                'WEEK'   => 604800,
+                default  => throw new RuntimeException('TIMESTAMPDIFF unit not supported: ' . (string) $unit),
+            };
+
+            // MySQL truncates toward zero; intdiv does the same.
+            return intdiv($seconds, $divisor);
+        }, 3, true);
+
+        // floor() and ceil() are part of SQLite's optional math functions,
+        // which not every PHP build compiles in. Supplied only where missing.
+        try {
+            $pdo->query('SELECT floor(1.5), ceil(1.5)');
+        } catch (PDOException) {
+            $register('floor', static fn (mixed $v): ?float => $v === null ? null : floor((float) $v), 1, true);
+            $register('ceil', static fn (mixed $v): ?float => $v === null ? null : ceil((float) $v), 1, true);
+        }
+
+        // JSON is compiled into every SQLite PHP has shipped for years, but
+        // the CHECK constraints depend on json_valid(), so a build without it
+        // gets an equivalent rather than an install that cannot write a log.
+        try {
+            $pdo->query("SELECT json_valid('{}')");
+        } catch (PDOException) {
+            $register('json_valid', static function (mixed $value): ?int {
+                if ($value === null) {
+                    return null;
+                }
+
+                json_decode((string) $value);
+
+                return json_last_error() === JSON_ERROR_NONE ? 1 : 0;
+            }, 1, true);
+        }
     }
 
     /** @param array<string|int,mixed> $bindings */
@@ -425,11 +505,7 @@ final class Database
 
         if (!array_key_exists($key, $this->columnCache)) {
             $this->columnCache[$key] = $this->scalar(
-                'SELECT 1 FROM information_schema.COLUMNS
-                  WHERE TABLE_SCHEMA = DATABASE()
-                    AND TABLE_NAME   = :t
-                    AND COLUMN_NAME  = :c
-                  LIMIT 1',
+                'SELECT 1 FROM pragma_table_xinfo(:t) WHERE name = :c LIMIT 1',
                 ['t' => $table, 'c' => $column]
             ) !== null;
         }
@@ -491,10 +567,25 @@ final class Database
 
     // ---------------------------------------------------------------- txn --
 
+    /**
+     * Transactions start IMMEDIATE: the write lock is taken at BEGIN, waiting
+     * up to busy_timeout_ms for another writer to finish.
+     *
+     * This is what replaces the row locks (SELECT ... FOR UPDATE) the MariaDB
+     * version relied on. SQLite has one writer at a time, so a transaction
+     * that holds the write lock from its first statement cannot have the rows
+     * it read changed underneath it — the guarantee FOR UPDATE gave, for the
+     * whole database rather than a row. A DEFERRED transaction would read
+     * first and then try to upgrade to a writer, and under WAL that upgrade
+     * fails at once with SQLITE_BUSY instead of waiting.
+     *
+     * PDO::beginTransaction() always issues a deferred BEGIN, so the statements
+     * are sent directly and PDO's own transaction flag is never used.
+     */
     public function beginTransaction(): void
     {
         if ($this->transactionDepth === 0) {
-            $this->pdo()->beginTransaction();
+            $this->pdo()->exec('BEGIN IMMEDIATE');
         } else {
             $this->pdo()->exec('SAVEPOINT sp_' . $this->transactionDepth);
         }
@@ -511,7 +602,7 @@ final class Database
         $this->transactionDepth--;
 
         if ($this->transactionDepth === 0) {
-            $this->pdo()->commit();
+            $this->pdo()->exec('COMMIT');
         } else {
             $this->pdo()->exec('RELEASE SAVEPOINT sp_' . $this->transactionDepth);
         }
@@ -526,8 +617,12 @@ final class Database
         $this->transactionDepth--;
 
         if ($this->transactionDepth === 0) {
-            if ($this->pdo()->inTransaction()) {
-                $this->pdo()->rollBack();
+            // A failed COMMIT, or an error SQLite answered by rolling back on
+            // its own, leaves nothing to roll back; asking again would throw
+            // over the exception that is already on its way out.
+            try {
+                $this->pdo()->exec('ROLLBACK');
+            } catch (PDOException) {
             }
         } else {
             $this->pdo()->exec('ROLLBACK TO SAVEPOINT sp_' . $this->transactionDepth);
@@ -540,8 +635,8 @@ final class Database
     }
 
     /**
-     * Run a closure inside a transaction, retrying on deadlock / lock-wait
-     * timeout with the backoff schedule from config. Any other exception rolls
+     * Run a closure inside a transaction, retrying when the database stayed
+     * busy past its timeout, with the backoff schedule from config. Any other exception rolls
      * back once and propagates — a partially-written attendance record is never
      * acceptable (Part 5, "never partially save attendance").
      *
@@ -569,7 +664,7 @@ final class Database
 
                 if ($this->isRetryable($e) && $attempt < $attempts - 1) {
                     $sleepMs = $backoff[$attempt] ?? 400;
-                    Logger::warning('Transaction deadlock, retrying', [
+                    Logger::warning('Database busy, retrying the transaction', [
                         'attempt'  => $attempt + 1,
                         'sleep_ms' => $sleepMs,
                     ]);
@@ -584,7 +679,12 @@ final class Database
         throw new RuntimeException('Transaction exhausted all retry attempts.');
     }
 
-    /** MySQL 1213 = deadlock, 1205 = lock wait timeout. Both are safe to retry. */
+    /**
+     * SQLITE_BUSY (5) and SQLITE_LOCKED (6): another connection held the write
+     * lock for longer than busy_timeout_ms. Nothing was written, so the whole
+     * transaction is safe to run again — the same reasoning the MariaDB
+     * version applied to a deadlock.
+     */
     private function isRetryable(Throwable $e): bool
     {
         if (!$e instanceof PDOException) {
@@ -593,28 +693,98 @@ final class Database
 
         $driverCode = (int) ($e->errorInfo[1] ?? 0);
 
-        return in_array($driverCode, [1213, 1205], true);
+        return in_array($driverCode, [5, 6], true)
+            || str_contains($e->getMessage(), 'database is locked');
     }
 
+    /** A UNIQUE or PRIMARY KEY constraint refused the row. */
     public static function isDuplicateKey(Throwable $e): bool
     {
-        return $e instanceof PDOException && (int) ($e->errorInfo[1] ?? 0) === 1062;
+        return $e instanceof PDOException
+            && (int) ($e->errorInfo[1] ?? 0) === 19
+            && str_contains($e->getMessage(), 'UNIQUE constraint failed');
     }
 
+    /**
+     * The name of the unique index a duplicate collided with, as the MariaDB
+     * schema named it (PRIMARY for a primary key).
+     *
+     * MySQL put the index name in the error. SQLite names the columns instead
+     * — "UNIQUE constraint failed: attendance_records.session_id,
+     * attendance_records.student_id" — so the index is found by matching those
+     * columns against the table's unique indexes. Callers decide what to tell
+     * the user from this name, so it has to be the same name they expect.
+     */
     public static function duplicateKeyName(Throwable $e): ?string
     {
         if (!self::isDuplicateKey($e)) {
             return null;
         }
 
-        // "Duplicate entry 'x' for key 'attendance_records.uq_session_student'"
-        if (preg_match("/for key '([^']+)'/", $e->getMessage(), $m) === 1) {
-            $parts = explode('.', $m[1]);
-
-            return end($parts) ?: null;
+        if (preg_match('/UNIQUE constraint failed: (.+)$/m', $e->getMessage(), $m) !== 1) {
+            return null;
         }
 
-        return null;
+        $table   = null;
+        $columns = [];
+
+        foreach (explode(',', $m[1]) as $qualified) {
+            $parts = explode('.', trim($qualified), 2);
+
+            if (count($parts) !== 2) {
+                return null;
+            }
+
+            $table     = $parts[0];
+            $columns[] = $parts[1];
+        }
+
+        if ($table === null || preg_match('/^\w+$/', $table) !== 1) {
+            return null;
+        }
+
+        try {
+            $pdo = self::instance()->pdo();
+
+            foreach ($pdo->query('PRAGMA index_list(' . $table . ')')->fetchAll(PDO::FETCH_ASSOC) as $index) {
+                if ((int) $index['unique'] !== 1) {
+                    continue;
+                }
+
+                $indexed = $pdo->query('PRAGMA index_info(' . $pdo->quote((string) $index['name']) . ')')
+                    ->fetchAll(PDO::FETCH_COLUMN, 2);
+
+                if ($indexed !== $columns) {
+                    continue;
+                }
+
+                if ($index['origin'] === 'pk') {
+                    return 'PRIMARY';
+                }
+
+                // Index names are per table in MySQL and per database in
+                // SQLite; a name used by several tables carries the table as
+                // a prefix (see database/migrations), which is not part of
+                // the name the application knows it by.
+                $name  = (string) $index['name'];
+                $split = strpos($name, '__');
+
+                return $split === false ? $name : substr($name, $split + 2);
+            }
+
+            // An INTEGER PRIMARY KEY is the rowid and has no index to list.
+            return count($columns) === 1 ? 'PRIMARY' : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** A FOREIGN KEY constraint refused the change. */
+    public static function isForeignKeyViolation(Throwable $e): bool
+    {
+        return $e instanceof PDOException
+            && (int) ($e->errorInfo[1] ?? 0) === 19
+            && str_contains($e->getMessage(), 'FOREIGN KEY constraint failed');
     }
 
     public function queryCount(): int

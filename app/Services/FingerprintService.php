@@ -599,7 +599,7 @@ final class FingerprintService
             "SELECT COUNT(*) FROM fingerprint_logs
               WHERE device_row_id = :device
                 AND result IN ('unknown','failed')
-                AND created_at > DATE_SUB(NOW(), INTERVAL :minutes MINUTE)",
+                AND created_at > datetime(NOW(), '-' || :minutes || ' minutes')",
             ['device' => $deviceRowId, 'minutes' => $windowMinutes]
         );
 
@@ -827,7 +827,11 @@ final class FingerprintService
             // knows about — an orphan template, a sensor that was not wiped when
             // records were cleared) is always real and always shown, whatever
             // the timing.
-            "SELECT d.id AS device_row_id, d.device_id, d.device_name,
+            //
+            // SQLite allows HAVING only on an aggregate query, so the per-row
+            // filter on the computed columns is an outer WHERE instead.
+            "SELECT * FROM (
+             SELECT d.id AS device_row_id, d.device_id, d.device_name,
                     c.room_number,
                     d.sensor_template_count, d.sensor_reported_at,
                     d.fingerprint_ok, d.last_heartbeat_at,
@@ -845,13 +849,14 @@ final class FingerprintService
           LEFT JOIN classrooms c ON c.classroom_id = d.classroom_id
               WHERE d.deleted_at IS NULL
                 AND d.sensor_template_count IS NOT NULL
-             HAVING d.sensor_template_count <> expected
+             ) AS reported
+              WHERE sensor_template_count <> expected
                 AND (
-                      d.sensor_template_count > expected
+                      sensor_template_count > expected
                    OR last_slot_change IS NULL
-                   OR d.sensor_reported_at >= last_slot_change
+                   OR sensor_reported_at >= last_slot_change
                 )
-              ORDER BY d.device_id",
+              ORDER BY device_id",
             ['stale_before' => Clock::now()->modify('-10 minutes')->format('Y-m-d H:i:s')]
         );
     }

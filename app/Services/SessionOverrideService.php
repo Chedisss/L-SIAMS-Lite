@@ -217,8 +217,8 @@ final class SessionOverrideService
                 AND sch.day_of_week = :day
                 AND sch.status      = 'active'
                 AND sch.deleted_at IS NULL
-                AND TIME(:now)  >= SUBTIME(sch.start_time, SEC_TO_TIME(sch.time_in_window_open * 60))
-                AND TIME(:now2) <= ADDTIME(sch.end_time,   SEC_TO_TIME(sch.time_out_window_close * 60))
+                AND TIME(:now)  >= time(sch.start_time, '-' || (sch.time_in_window_open * 60) || ' seconds')
+                AND TIME(:now2) <= time(sch.end_time, '+' || (sch.time_out_window_close * 60) || ' seconds')
               ORDER BY sch.start_time,
                        -- A room with an entry/exit pair has two rows. Prefer
                        -- the one that has actually claimed its key and is

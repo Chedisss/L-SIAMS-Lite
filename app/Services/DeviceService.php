@@ -288,7 +288,7 @@ final class DeviceService
                    FROM device_claims c
                    JOIN devices d ON d.id = c.device_row_id
                   WHERE c.claim_token_hash = :hash
-                  LIMIT 1 FOR UPDATE',
+                  LIMIT 1',
                 ['hash' => hash('sha256', $claimToken)]
             );
 
@@ -787,7 +787,7 @@ final class DeviceService
               WHERE status = 'active'
                 AND claim_status = 'claimed'
                 AND deleted_at IS NULL
-                AND (last_heartbeat_at IS NULL OR last_heartbeat_at < DATE_SUB(NOW(), INTERVAL :timeout SECOND))",
+                AND (last_heartbeat_at IS NULL OR last_heartbeat_at < datetime(NOW(), '-' || :timeout || ' seconds'))",
             ['timeout' => $timeout]
         );
 
@@ -1122,7 +1122,7 @@ final class DeviceService
     public static function purgeOldHeartbeats(int $days): int
     {
         return Database::instance()->execute(
-            'DELETE FROM device_heartbeats WHERE created_at < DATE_SUB(NOW(), INTERVAL :days DAY)',
+            'DELETE FROM device_heartbeats WHERE created_at < datetime(NOW(), \'-\' || :days || \' days\')',
             ['days' => $days]
         );
     }
@@ -1142,7 +1142,7 @@ final class DeviceService
         return Database::instance()->select(
             'SELECT created_at, wifi_signal, queue_depth, uptime_seconds, battery_percent
                FROM device_heartbeats
-              WHERE device_row_id = :id AND created_at >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+              WHERE device_row_id = :id AND created_at >= datetime(NOW(), \'-\' || :hours || \' hours\')
               ORDER BY heartbeat_id DESC LIMIT 500',
             ['id' => $deviceRowId, 'hours' => $hours]
         );

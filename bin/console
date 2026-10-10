@@ -344,26 +344,14 @@ function discoverMigrations(): array
 }
 
 /**
- * `CREATE TABLE IF NOT EXISTS` still needs the CREATE privilege, even when the
- * table is already there and nothing is created. The application's own database
- * user does not have it — deliberately, because migrations run as a separate,
- * more privileged account (docs/DEPLOYMENT.md) — so every read-only caller of
- * this function, `doctor` and `migrate:status` among them, died on a table that
- * had existed for months.
- *
- * Which is the wrong way round: those two commands are exactly what somebody
- * runs when the system is misbehaving, and a correctly locked-down installation
- * is precisely where they would refuse to run.
- *
- * So existence is checked first and the CREATE is only attempted when there is
- * genuinely something to create. `migrate` itself still needs the privileged
- * user and still says so plainly when it does not have it.
+ * Create the bookkeeping table on a new database file. Checked first rather
+ * than relying on IF NOT EXISTS alone, so read-only callers such as `doctor`
+ * and `migrate:status` never write to the file just by looking at it.
  */
 function ensureMigrationsTable(Database $db): void
 {
     $exists = (int) $db->scalar(
-        'SELECT COUNT(*) FROM information_schema.TABLES
-          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :name',
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = :name",
         ['name' => 'schema_migrations']
     );
 
@@ -373,11 +361,11 @@ function ensureMigrationsTable(Database $db): void
 
     $db->pdo()->exec(
         'CREATE TABLE IF NOT EXISTS schema_migrations (
-            migration  VARCHAR(190) NOT NULL PRIMARY KEY,
-            batch      INT UNSIGNED NOT NULL,
-            checksum   CHAR(64)     NOT NULL,
-            applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+            migration  TEXT    NOT NULL PRIMARY KEY,
+            batch      INTEGER NOT NULL,
+            checksum   TEXT    NOT NULL,
+            applied_at TEXT    NOT NULL DEFAULT (now())
+        )'
     );
 }
 
@@ -421,16 +409,14 @@ function commandMigrate(): void
         $sql = (string) file_get_contents($migration['path']);
 
         try {
-            runSqlScript($db, $sql);
+            runMigration($db, $sql, [
+                'migration' => $migration['name'],
+                'batch'     => $batch,
+                'checksum'  => $migration['checksum'],
+            ]);
         } catch (Throwable $e) {
-            fail($migration['name'] . ' failed: ' . $e->getMessage());
+            fail($migration['name'] . ' failed, and nothing it did was kept: ' . $e->getMessage());
         }
-
-        $db->insert('schema_migrations', [
-            'migration' => $migration['name'],
-            'batch'     => $batch,
-            'checksum'  => $migration['checksum'],
-        ]);
 
         ok('  ' . $migration['name']);
         $pending++;
@@ -518,66 +504,55 @@ function commandMigrateRechecksum(array $flags): void
 }
 
 /**
- * Execute a .sql file, honouring DELIMITER blocks so triggers and procedures
- * containing internal semicolons are not split apart.
- */
-function runSqlScript(Database $db, string $sql): void
-{
-    foreach (splitSqlStatements($sql) as $statement) {
-        $db->pdo()->exec($statement);
-    }
-}
-
-/**
- * Break a .sql file into individual statements, honouring DELIMITER blocks so
- * triggers and procedures containing internal semicolons stay in one piece.
+ * Apply one migration file and record it, as a single transaction.
  *
- * @return list<string>
+ * SQLite runs schema changes inside a transaction like any other write, so a
+ * migration either happens completely, recorded in schema_migrations, or not
+ * at all — there is no half-applied state to recover from on the next run.
+ *
+ * Foreign keys are switched off while it runs, because several migrations
+ * rebuild a table (create the new shape, copy, drop the old one, rename), and
+ * with them on, dropping a table that others reference would fire their ON
+ * DELETE actions. legacy_alter_table keeps a rename from rewriting the views
+ * and triggers that refer to the table by name. Both have to be set outside
+ * the transaction, where SQLite honours them. Before committing,
+ * foreign_key_check confirms that every reference still resolves; if one does
+ * not, the migration is rolled back rather than leaving a broken link behind.
+ *
+ * @param array{migration:string,batch:int,checksum:string} $record
  */
-function splitSqlStatements(string $sql): array
+function runMigration(Database $db, string $sql, array $record): void
 {
-    $delimiter  = ';';
-    $buffer     = '';
-    $statements = [];
+    $pdo = $db->pdo();
+    $pdo->exec('PRAGMA foreign_keys = OFF');
+    $pdo->exec('PRAGMA legacy_alter_table = ON');
 
-    foreach (preg_split('/\r\n|\n|\r/', $sql) ?: [] as $line) {
-        $trimmed = trim($line);
+    try {
+        $db->transaction(static function (Database $db) use ($pdo, $sql, $record): void {
+            // pdo_sqlite runs every statement in the string, triggers included.
+            $pdo->exec($sql);
 
-        if ($trimmed === '' || str_starts_with($trimmed, '--')) {
-            continue;
-        }
+            $broken = $db->select('PRAGMA foreign_key_check');
 
-        if (stripos($trimmed, 'DELIMITER ') === 0) {
-            if (trim($buffer) !== '') {
-                $statements[] = $buffer;
-                $buffer       = '';
+            if ($broken !== []) {
+                $first = $broken[0];
+
+                throw new RuntimeException(sprintf(
+                    '%d row(s) would point at something that does not exist (first: %s row %s -> %s).',
+                    count($broken),
+                    (string) $first['table'],
+                    (string) $first['rowid'],
+                    (string) $first['parent']
+                ));
             }
 
-            $delimiter = trim(substr($trimmed, 10));
-            continue;
-        }
-
-        $buffer .= $line . "\n";
-
-        if (str_ends_with($trimmed, $delimiter)) {
-            $statement = substr(rtrim($buffer), 0, -strlen($delimiter));
-
-            if (trim($statement) !== '') {
-                $statements[] = $statement;
-            }
-
-            $buffer = '';
-        }
+            $db->insert('schema_migrations', $record);
+        });
+    } finally {
+        $pdo->exec('PRAGMA legacy_alter_table = OFF');
+        $pdo->exec('PRAGMA foreign_keys = ON');
+        $db->forgetPendingMigrations();
     }
-
-    if (trim($buffer) !== '') {
-        $statements[] = $buffer;
-    }
-
-    return array_values(array_filter(
-        $statements,
-        static fn (string $statement): bool => trim($statement) !== ''
-    ));
 }
 
 function commandMigrateStatus(): void
@@ -610,21 +585,30 @@ function commandMigrateFresh(array $flags): void
 
     heading('Dropping all tables');
 
-    $db = Database::instance();
-    $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 0');
+    $db  = Database::instance();
+    $pdo = $db->pdo();
+    $pdo->exec('PRAGMA foreign_keys = OFF');
 
-    foreach ($db->select('SHOW FULL TABLES WHERE Table_type = "VIEW"') as $row) {
-        $name = (string) array_values($row)[0];
-        $db->pdo()->exec(sprintf('DROP VIEW IF EXISTS `%s`', $name));
+    // Views and triggers first, since they name the tables; then the tables.
+    foreach (['view', 'trigger', 'table'] as $type) {
+        $names = $db->select(
+            "SELECT name FROM sqlite_master WHERE type = :type AND name NOT LIKE 'sqlite_%'",
+            ['type' => $type]
+        );
+
+        foreach ($names as $row) {
+            $pdo->exec(sprintf('DROP %s IF EXISTS "%s"', strtoupper($type), str_replace('"', '""', (string) $row['name'])));
+
+            if ($type === 'table') {
+                out('  dropped ' . $row['name'], 'grey');
+            }
+        }
     }
 
-    foreach ($db->select('SHOW FULL TABLES WHERE Table_type = "BASE TABLE"') as $row) {
-        $name = (string) array_values($row)[0];
-        $db->pdo()->exec(sprintf('DROP TABLE IF EXISTS `%s`', $name));
-        out('  dropped ' . $name, 'grey');
-    }
-
-    $db->pdo()->exec('SET FOREIGN_KEY_CHECKS = 1');
+    $pdo->exec('PRAGMA foreign_keys = ON');
+    // Give the space back: an emptied SQLite file keeps its size otherwise.
+    $pdo->exec('VACUUM');
+    $db->forgetPendingMigrations();
     ok('Schema dropped.');
 
     commandMigrate();
@@ -794,7 +778,7 @@ function commandWorker(array $arguments): void
                     'requests'     => IdempotencyService::purgeOld((int) ($retention['processed_requests_hours'] ?? 24)),
                     'tickets'      => RealtimeService::purgeExpiredTickets(),
                     'nonces'       => Database::instance()->execute(
-                        'DELETE FROM device_nonces WHERE used_at < DATE_SUB(NOW(), INTERVAL :hours HOUR)',
+                        'DELETE FROM device_nonces WHERE used_at < datetime(NOW(), \'-\' || :hours || \' hours\')',
                         ['hours' => (int) ($retention['nonces_hours'] ?? 24)]
                     ),
                 ];
@@ -4715,7 +4699,7 @@ function commandScheduleGradeThree(array $flags): void
         // Grade 3, or ScheduleService refuses: a teacher with no grade levels
         // cannot be given a section, and the section's grade must be among them.
         $db->execute(
-            'INSERT IGNORE INTO teacher_grade_levels (teacher_id, grade_level_id, assigned_by, created_at)
+            'INSERT OR IGNORE INTO teacher_grade_levels (teacher_id, grade_level_id, assigned_by, created_at)
              VALUES (:t, :g, :u, :n)',
             ['t' => $teacherIds[$first], 'g' => (int) $section['grade_level_id'], 'u' => $adminId, 'n' => Clock::nowString()]
         );
@@ -4749,7 +4733,7 @@ function commandScheduleGradeThree(array $flags): void
         }
 
         $secondary += $db->execute(
-            'INSERT IGNORE INTO teacher_departments (teacher_id, department_id, is_primary, assigned_by, created_at)
+            'INSERT OR IGNORE INTO teacher_departments (teacher_id, department_id, is_primary, assigned_by, created_at)
              VALUES (:t, :d, 0, :u, :n)',
             ['t' => $teacherIds[$teacher], 'd' => $subjectDepartment, 'u' => $adminId, 'n' => Clock::nowString()]
         );

@@ -59,7 +59,7 @@ final class DashboardService
         // Tap-to-acknowledgement is what Part 17.1 sets a p95 target for; the
         // proxy here is the spread between session open and each record.
         $processing = $db->selectOne(
-            "SELECT AVG(TIMESTAMPDIFF(SECOND, s.opened_at, ar.created_at)) AS avg_seconds
+            "SELECT AVG(TIMESTAMPDIFF('SECOND', s.opened_at, ar.created_at)) AS avg_seconds
                FROM attendance_records ar
                JOIN attendance_sessions s ON s.session_id = ar.session_id
               WHERE s.session_date = :today AND ar.time_in IS NOT NULL",
@@ -121,7 +121,7 @@ final class DashboardService
 
         $weekSessions = (int) $db->scalar(
             'SELECT COUNT(*) FROM attendance_sessions
-              WHERE teacher_id = :teacher AND session_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)',
+              WHERE teacher_id = :teacher AND session_date >= date(CURDATE(), \'-7 days\')',
             ['teacher' => $teacherId]
         );
 
@@ -170,8 +170,8 @@ final class DashboardService
             // the class times leaves a teacher scanning at what looks like the
             // right moment and being refused with no explanation on screen.
             "SELECT sch.schedule_id, sch.start_time, sch.end_time,
-                    SUBTIME(sch.start_time, SEC_TO_TIME(sch.time_in_window_open * 60))  AS scan_opens,
-                    ADDTIME(sch.end_time,   SEC_TO_TIME(sch.time_out_window_close * 60)) AS scan_closes,
+                    time(sch.start_time, '-' || (sch.time_in_window_open * 60) || ' seconds')  AS scan_opens,
+                    time(sch.end_time, '+' || (sch.time_out_window_close * 60) || ' seconds') AS scan_closes,
                     sub.subject_code, sub.subject_name, sec.section_code, c.room_number,
                     d.device_id, d.status AS device_status,
                     (SELECT s2.status FROM attendance_sessions s2
@@ -214,7 +214,7 @@ final class DashboardService
         // started, otherwise the same weekday next week.
         $weekly = $db->select(
             "SELECT sch.day_of_week, sch.start_time, sch.end_time,
-                    SUBTIME(sch.start_time, SEC_TO_TIME(sch.time_in_window_open * 60)) AS scan_opens,
+                    time(sch.start_time, '-' || (sch.time_in_window_open * 60) || ' seconds') AS scan_opens,
                     sub.subject_code, sec.section_code, c.room_number
                FROM schedules sch
                JOIN subjects sub ON sub.subject_id = sch.subject_id
@@ -301,7 +301,7 @@ final class DashboardService
      */
     public static function attendanceTrend(int $days = 14, ?int $teacherId = null): array
     {
-        $where    = ['s.session_date >= DATE_SUB(CURDATE(), INTERVAL :days DAY)'];
+        $where    = ['s.session_date >= date(CURDATE(), \'-\' || :days || \' days\')'];
         $bindings = ['days' => max(1, min($days, 365))];
 
         if ($teacherId !== null) {
@@ -316,8 +316,8 @@ final class DashboardService
                     SUM(CASE WHEN ar.final_status = 'Late' THEN 1 ELSE 0 END) AS late,
                     SUM(CASE WHEN ar.final_status = 'Absent' THEN 1 ELSE 0 END) AS absent,
                     SUM(CASE WHEN ar.final_status = 'Left Early' THEN 1 ELSE 0 END) AS left_early,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage
                FROM attendance_records ar
                JOIN attendance_sessions s ON s.session_id = ar.session_id
               WHERE " . implode(' AND ', $where) . '

@@ -208,7 +208,7 @@ final class TeacherService
                 $db->execute(
                     'INSERT INTO teacher_departments (teacher_id, department_id, is_primary, assigned_by)
                           VALUES (:t, :d, 1, :u)
-                     ON DUPLICATE KEY UPDATE is_primary = 1',
+                     ON CONFLICT (teacher_id, department_id) DO UPDATE SET is_primary = 1',
                     ['t' => $teacherId, 'd' => $newDepartmentId, 'u' => $userId]
                 );
 
@@ -307,7 +307,7 @@ final class TeacherService
 
         foreach (array_unique($gradeLevelIds) as $gradeLevelId) {
             $db->execute(
-                'INSERT IGNORE INTO teacher_grade_levels (teacher_id, grade_level_id, assigned_by)
+                'INSERT OR IGNORE INTO teacher_grade_levels (teacher_id, grade_level_id, assigned_by)
                       VALUES (:t, :g, :u)',
                 ['t' => $teacherId, 'g' => $gradeLevelId, 'u' => $userId]
             );
@@ -331,7 +331,7 @@ final class TeacherService
             );
 
             $db->execute(
-                'INSERT IGNORE INTO teacher_subjects (teacher_id, subject_id, assigned_by, is_exception)
+                'INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_id, assigned_by, is_exception)
                       VALUES (:t, :s, :u, :ex)',
                 [
                     't'  => $teacherId,
@@ -352,7 +352,7 @@ final class TeacherService
 
         foreach (array_unique($sectionIds) as $sectionId) {
             $db->execute(
-                'INSERT IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
+                'INSERT OR IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
                 ['t' => $teacherId, 's' => $sectionId, 'u' => $userId]
             );
         }
@@ -424,10 +424,12 @@ final class TeacherService
 
         $rows = $db->select(
             "SELECT t.*, d.department_name, d.department_code, u.username, u.status AS account_status,
-                    (SELECT GROUP_CONCAT(gl.grade_level_code ORDER BY gl.numeric_level SEPARATOR ', ')
-                       FROM teacher_grade_levels tgl
-                       JOIN grade_levels gl ON gl.grade_level_id = tgl.grade_level_id
-                      WHERE tgl.teacher_id = t.teacher_id) AS grade_levels,
+                    (SELECT group_concat(o.grade_level_code, ', ')
+                       FROM (SELECT gl.grade_level_code
+                               FROM teacher_grade_levels tgl
+                               JOIN grade_levels gl ON gl.grade_level_id = tgl.grade_level_id
+                              WHERE tgl.teacher_id = t.teacher_id
+                              ORDER BY gl.numeric_level) AS o) AS grade_levels,
                     (SELECT COUNT(*) FROM teacher_subjects ts WHERE ts.teacher_id = t.teacher_id) AS subject_count,
                     (SELECT COUNT(*) FROM teacher_sections tsec WHERE tsec.teacher_id = t.teacher_id) AS section_count,
                     (SELECT COUNT(*) FROM schedules sch
@@ -803,8 +805,8 @@ final class TeacherService
                 -- it stopped at end_time, so a teacher scanning during the
                 -- tap-out tail got no diagnosis at all while the terminal was
                 -- still perfectly willing to be scanned at.
-                AND TIME(:now) >= SUBTIME(sch.start_time, SEC_TO_TIME(sch.time_in_window_open * 60))
-                AND TIME(:now2) <= ADDTIME(sch.end_time, SEC_TO_TIME(sch.time_out_window_close * 60))
+                AND TIME(:now) >= time(sch.start_time, '-' || (sch.time_in_window_open * 60) || ' seconds')
+                AND TIME(:now2) <= time(sch.end_time, '+' || (sch.time_out_window_close * 60) || ' seconds')
               ORDER BY sch.start_time
               LIMIT 1",
             [
@@ -996,7 +998,17 @@ final class TeacherService
                     sec.section_name,
                     gl.grade_level_code,
                     gl.grade_level_name,
-                    GROUP_CONCAT(DISTINCT sub.subject_code ORDER BY sub.subject_code SEPARATOR ', ') AS subject_codes,
+                    -- The codes this teacher teaches the section, sorted;
+                    -- group_concat() keeps the order its subquery hands over.
+                    (SELECT group_concat(o.subject_code, ', ')
+                       FROM (SELECT DISTINCT sub2.subject_code
+                               FROM schedules sch2
+                               JOIN subjects sub2 ON sub2.subject_id = sch2.subject_id
+                              WHERE sch2.teacher_id = :teacher
+                                AND sch2.section_id = sec.section_id
+                                AND sch2.status = 'active'
+                                AND sch2.deleted_at IS NULL
+                              ORDER BY sub2.subject_code) AS o) AS subject_codes,
                     COUNT(DISTINCT sch.subject_id) AS subject_count,
                     (SELECT COUNT(*) FROM students st
                       WHERE st.section_id = sec.section_id
@@ -1044,7 +1056,15 @@ final class TeacherService
         $section = $db->selectOne(
             "SELECT sec.section_id, sec.section_code, sec.section_name, sec.capacity,
                     gl.grade_level_code, gl.grade_level_name,
-                    GROUP_CONCAT(DISTINCT sub.subject_code ORDER BY sub.subject_code SEPARATOR ', ') AS subject_codes
+                    (SELECT group_concat(o.subject_code, ', ')
+                       FROM (SELECT DISTINCT sub2.subject_code
+                               FROM schedules sch2
+                               JOIN subjects sub2 ON sub2.subject_id = sch2.subject_id
+                              WHERE sch2.teacher_id = :teacher
+                                AND sch2.section_id = sec.section_id
+                                AND sch2.status = 'active'
+                                AND sch2.deleted_at IS NULL
+                              ORDER BY sub2.subject_code) AS o) AS subject_codes
                FROM schedules sch
                JOIN sections sec    ON sec.section_id = sch.section_id
                JOIN grade_levels gl ON gl.grade_level_id = sec.grade_level_id

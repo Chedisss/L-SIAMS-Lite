@@ -102,11 +102,11 @@ final class NetworkService
         Database::instance()->execute(
             'INSERT INTO blocked_ips (ip_address, reason, blocked_by, auto_blocked, expires_at, status)
                   VALUES (:ip, :reason, :user, :auto, :expires, \'active\')
-             ON DUPLICATE KEY UPDATE
-                  reason = VALUES(reason),
-                  blocked_by = VALUES(blocked_by),
-                  auto_blocked = VALUES(auto_blocked),
-                  expires_at = VALUES(expires_at),
+             ON CONFLICT (ip_address) DO UPDATE SET
+                  reason = excluded.reason,
+                  blocked_by = excluded.blocked_by,
+                  auto_blocked = excluded.auto_blocked,
+                  expires_at = excluded.expires_at,
                   status = \'active\'',
             [
                 'ip'      => $ip,

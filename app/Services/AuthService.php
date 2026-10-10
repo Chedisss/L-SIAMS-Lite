@@ -283,7 +283,7 @@ final class AuthService
         $recent = (int) Database::instance()->scalar(
             'SELECT COUNT(*) FROM login_attempts
               WHERE identifier = :identifier AND ip_address = :ip
-                AND attempted_at > DATE_SUB(NOW(), INTERVAL :window SECOND)',
+                AND attempted_at > datetime(NOW(), \'-\' || :window || \' seconds\')',
             ['identifier' => $identifier, 'ip' => $ip, 'window' => $config['window']]
         );
 

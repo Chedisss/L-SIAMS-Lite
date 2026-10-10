@@ -5,6 +5,9 @@
 /storage/reports/*
 /storage/tmp/*
 /storage/framework/sessions/*
+# The database itself, and SQLite's -wal and -shm files beside it. Never
+# tracked: update.bat replaces every tracked file, and this is the school's data.
+/storage/database/*
 # The school's certificate authority and the server key it signs. Private keys,
 # and a repository is the last place they should be able to reach.
 /storage/tls/*

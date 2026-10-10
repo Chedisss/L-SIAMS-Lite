@@ -897,8 +897,8 @@ final class ReportService
                     SUM(CASE WHEN ar.final_status = 'Present' THEN 1 ELSE 0 END) AS present,
                     SUM(CASE WHEN ar.final_status = 'Late' THEN 1 ELSE 0 END) AS late,
                     SUM(CASE WHEN ar.final_status = 'Absent' THEN 1 ELSE 0 END) AS absent,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage
                FROM sections sec
                JOIN students st ON st.section_id = sec.section_id AND st.deleted_at IS NULL
                JOIN attendance_records ar ON ar.student_id = st.student_id

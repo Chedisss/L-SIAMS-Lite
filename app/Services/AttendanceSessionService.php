@@ -93,7 +93,7 @@ final class AttendanceSessionService
                        FROM attendance_sessions s
                        JOIN teachers t ON t.teacher_id = s.teacher_id
                       WHERE s.classroom_id = :classroom AND s.status = 'open'
-                      LIMIT 1 FOR UPDATE",
+                      LIMIT 1",
                     ['classroom' => (int) $schedule['classroom_id']]
                 );
 
@@ -165,7 +165,7 @@ final class AttendanceSessionService
                 $earlier = $db->selectOne(
                     "SELECT * FROM attendance_sessions
                       WHERE schedule_id = :schedule AND session_date = :date
-                      LIMIT 1 FOR UPDATE",
+                      LIMIT 1",
                     ['schedule' => (int) $schedule['schedule_id'], 'date' => $date]
                 );
 
@@ -380,7 +380,7 @@ final class AttendanceSessionService
 
         return $db->transaction(static function (Database $db) use ($sessionId, $closedByType, $closedByUserId): array {
             $session = $db->selectOne(
-                'SELECT * FROM attendance_sessions WHERE session_id = :id LIMIT 1 FOR UPDATE',
+                'SELECT * FROM attendance_sessions WHERE session_id = :id LIMIT 1',
                 ['id' => $sessionId]
             );
 
@@ -404,8 +404,7 @@ final class AttendanceSessionService
             // 1. Settle every record that has a time-in but no time-out.
             $pending = $db->select(
                 'SELECT * FROM attendance_records
-                  WHERE session_id = :id AND time_in IS NOT NULL AND time_out IS NULL
-                  FOR UPDATE',
+                  WHERE session_id = :id AND time_in IS NOT NULL AND time_out IS NULL',
                 ['id' => $sessionId]
             );
 
@@ -925,7 +924,7 @@ final class AttendanceSessionService
                JOIN subjects sub ON sub.subject_id = s.subject_id
                JOIN classrooms c ON c.classroom_id = s.classroom_id
               WHERE s.status = 'open'
-                AND s.expires_at BETWEEN :now AND DATE_ADD(:now, INTERVAL :minutes MINUTE)",
+                AND s.expires_at BETWEEN :now AND datetime(:now, '+' || :minutes || ' minutes')",
             ['now' => Clock::nowString(), 'minutes' => $warnMinutes]
         );
 

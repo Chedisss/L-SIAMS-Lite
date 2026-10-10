@@ -317,8 +317,8 @@ final class SessionService
             "SELECT s.session_id, s.user_id, u.username, u.full_name, r.role_name,
                     s.ip_address, s.device_label, s.browser_label, s.created_at,
                     s.last_activity_at, s.idle_expires_at, s.absolute_expires_at,
-                    TIMESTAMPDIFF(SECOND, s.last_activity_at, NOW()) AS idle_seconds,
-                    TIMESTAMPDIFF(SECOND, NOW(), s.idle_expires_at) AS expires_in_seconds
+                    TIMESTAMPDIFF('SECOND', s.last_activity_at, NOW()) AS idle_seconds,
+                    TIMESTAMPDIFF('SECOND', NOW(), s.idle_expires_at) AS expires_in_seconds
                FROM user_sessions s
                JOIN users u ON u.user_id = s.user_id
                JOIN roles r ON r.role_id = u.role_id

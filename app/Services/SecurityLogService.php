@@ -340,11 +340,11 @@ final class SecurityLogService
     public static function trend(int $hours = 24): array
     {
         return Database::instance()->select(
-            'SELECT DATE_FORMAT(created_at, \'%Y-%m-%d %H:00\') AS bucket,
+            'SELECT strftime(\'%Y-%m-%d %H:00\', created_at) AS bucket,
                     severity,
                     COUNT(*) AS total
                FROM security_logs
-              WHERE created_at >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+              WHERE created_at >= datetime(NOW(), \'-\' || :hours || \' hours\')
               GROUP BY bucket, severity
               ORDER BY bucket',
             ['hours' => max(1, min($hours, 168))]

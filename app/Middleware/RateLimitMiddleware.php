@@ -64,7 +64,7 @@ final class RateLimitMiddleware extends Middleware
             $db->execute(
                 'INSERT INTO rate_limits (bucket_key, hits, window_start, blocked_until)
                       VALUES (:key, 1, :now, NULL)
-                 ON DUPLICATE KEY UPDATE hits = 1, window_start = VALUES(window_start), blocked_until = NULL',
+                 ON CONFLICT (bucket_key) DO UPDATE SET hits = 1, window_start = excluded.window_start, blocked_until = NULL',
                 ['key' => $key, 'now' => $now->format('Y-m-d H:i:s')]
             );
 

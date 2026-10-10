@@ -138,7 +138,7 @@ final class SettingsService
             foreach ($values as $key => $newValue) {
                 $existing = $db->selectOne(
                     'SELECT setting_key, setting_value, value_type, min_value, max_value
-                       FROM settings WHERE setting_key = :key FOR UPDATE',
+                       FROM settings WHERE setting_key = :key',
                     ['key' => $key]
                 );
 

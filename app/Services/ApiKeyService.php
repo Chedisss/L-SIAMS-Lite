@@ -479,12 +479,12 @@ final class ApiKeyService
 
         return Database::instance()->select(
             "SELECT k.api_key_id, k.key_id, k.secret_last_four, k.created_at, k.last_used_at,
-                    DATEDIFF(NOW(), k.created_at) AS age_days,
+                    CAST(julianday(date(NOW())) - julianday(date(k.created_at)) AS INTEGER) AS age_days,
                     d.device_id, d.device_name, c.room_number
                FROM api_keys k
                LEFT JOIN devices d    ON d.id = k.device_row_id
                LEFT JOIN classrooms c ON c.classroom_id = d.classroom_id
-              WHERE k.status = 'active' AND k.created_at < DATE_SUB(NOW(), INTERVAL :days DAY)
+              WHERE k.status = 'active' AND k.created_at < datetime(NOW(), '-' || :days || ' days')
               ORDER BY k.created_at ASC",
             ['days' => $days]
         );

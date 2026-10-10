@@ -144,8 +144,7 @@ final class RfidEnrollmentService
                    FROM rfid_enrollment_requests
                   WHERE device_row_id = :device
                     AND status IN ('pending','waiting')
-                  ORDER BY request_id DESC LIMIT 1
-                    FOR UPDATE",
+                  ORDER BY request_id DESC LIMIT 1",
                 ['device' => $deviceRowId]
             );
 
@@ -210,8 +209,7 @@ final class RfidEnrollmentService
               LEFT JOIN students s ON s.student_id = r.student_id
                   WHERE r.device_row_id = :device
                     AND r.status IN ('pending','waiting')
-                  ORDER BY r.request_id ASC LIMIT 1
-                    FOR UPDATE",
+                  ORDER BY r.request_id ASC LIMIT 1",
                 ['device' => $deviceRowId]
             );
 

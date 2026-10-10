@@ -543,12 +543,12 @@ final class ScheduleService
         $db = Database::instance();
 
         $db->execute(
-            'INSERT IGNORE INTO teacher_subjects (teacher_id, subject_id, assigned_by) VALUES (:t, :s, :u)',
+            'INSERT OR IGNORE INTO teacher_subjects (teacher_id, subject_id, assigned_by) VALUES (:t, :s, :u)',
             ['t' => $teacherId, 's' => $subjectId, 'u' => $userId]
         );
 
         $db->execute(
-            'INSERT IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
+            'INSERT OR IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
             ['t' => $teacherId, 's' => $sectionId, 'u' => $userId]
         );
     }
@@ -593,8 +593,8 @@ final class ScheduleService
                 AND sch.deleted_at IS NULL
                 -- The window a session may be opened in: from tap-in open
                 -- through to tap-out close.
-                AND TIME(:now) >= SUBTIME(sch.start_time, SEC_TO_TIME(sch.time_in_window_open * 60))
-                AND TIME(:now) <= ADDTIME(sch.end_time, SEC_TO_TIME(sch.time_out_window_close * 60))
+                AND TIME(:now) >= time(sch.start_time, \'-\' || (sch.time_in_window_open * 60) || \' seconds\')
+                AND TIME(:now) <= time(sch.end_time, \'+\' || (sch.time_out_window_close * 60) || \' seconds\')
               ORDER BY sch.start_time',
             ['device' => $deviceRowId, 'day' => $day, 'now' => $at->format('H:i:s')]
         );

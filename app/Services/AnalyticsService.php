@@ -23,8 +23,8 @@ final class AnalyticsService
                     SUM(CASE WHEN ar.final_status = 'Present' THEN 1 ELSE 0 END) AS present,
                     SUM(CASE WHEN ar.final_status = 'Late' THEN 1 ELSE 0 END) AS late,
                     SUM(CASE WHEN ar.final_status = 'Absent' THEN 1 ELSE 0 END) AS absent,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage
                FROM attendance_records ar
                JOIN grade_levels gl ON gl.grade_level_id = ar.grade_level_id
                JOIN attendance_sessions s ON s.session_id = ar.session_id
@@ -61,8 +61,8 @@ final class AnalyticsService
                     SUM(CASE WHEN ar.final_status = 'Present' THEN 1 ELSE 0 END) AS present,
                     SUM(CASE WHEN ar.final_status = 'Late' THEN 1 ELSE 0 END) AS late,
                     SUM(CASE WHEN ar.final_status = 'Absent' THEN 1 ELSE 0 END) AS absent,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage
                FROM attendance_records ar
                JOIN sections sec    ON sec.section_id = ar.section_id
                JOIN grade_levels gl ON gl.grade_level_id = ar.grade_level_id
@@ -97,8 +97,8 @@ final class AnalyticsService
         return Database::instance()->select(
             "SELECT sub.subject_code AS label, sub.subject_name, d.department_name,
                     COUNT(*) AS total,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage,
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage,
                     SUM(CASE WHEN ar.final_status = 'Incomplete' THEN 1 ELSE 0 END) AS incomplete
                FROM attendance_records ar
                JOIN subjects sub    ON sub.subject_id = ar.subject_id
@@ -150,8 +150,8 @@ final class AnalyticsService
                     SUM(CASE WHEN ar.final_status = 'Late' THEN 1 ELSE 0 END) AS late,
                     SUM(CASE WHEN ar.final_status = 'Absent' THEN 1 ELSE 0 END) AS absent,
                     SUM(CASE WHEN ar.final_status = 'Left Early' THEN 1 ELSE 0 END) AS left_early,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage
                FROM attendance_records ar
                JOIN attendance_sessions s ON s.session_id = ar.session_id
                JOIN sections sec  ON sec.section_id = ar.section_id
@@ -170,8 +170,8 @@ final class AnalyticsService
             "SELECT CONCAT(t.last_name, ', ', t.first_name) AS label, d.department_name,
                     COUNT(DISTINCT s.session_id) AS sessions,
                     COUNT(*) AS total,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage
                FROM attendance_records ar
                JOIN teachers t    ON t.teacher_id = ar.teacher_id
                JOIN departments d ON d.department_id = t.department_id
@@ -210,8 +210,8 @@ final class AnalyticsService
             "SELECT s.session_date AS date,
                     SUM(CASE WHEN ar.final_status = 'Left Early' THEN 1 ELSE 0 END) AS left_early,
                     COUNT(*) AS total,
-                    ROUND(SUM(CASE WHEN ar.final_status = 'Left Early' THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 2) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status = 'Left Early' THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 2) AS percentage
                FROM attendance_records ar
                JOIN attendance_sessions s ON s.session_id = ar.session_id
               WHERE s.session_date BETWEEN :from AND :to
@@ -249,18 +249,20 @@ final class AnalyticsService
     public static function timeInDistribution(string $from, string $to): array
     {
         return Database::instance()->select(
+            // 5.0, not 5: SQLite divides integers as integers, rounding toward
+            // zero, and an early arrival (a negative offset) has to round down
+            // into the bucket below as FLOOR did in MariaDB. printf('%3d')
+            // is LPAD(..., 3, ' ').
             "SELECT
-                CONCAT(
-                  LPAD(FLOOR(TIMESTAMPDIFF(MINUTE, s.scheduled_start, ar.time_in) / 5) * 5, 3, ' '),
-                  ' min'
-                ) AS label,
-                FLOOR(TIMESTAMPDIFF(MINUTE, s.scheduled_start, ar.time_in) / 5) * 5 AS offset_minutes,
+                printf('%3d', CAST(FLOOR(TIMESTAMPDIFF('MINUTE', s.scheduled_start, ar.time_in) / 5.0) * 5 AS INTEGER))
+                  || ' min' AS label,
+                CAST(FLOOR(TIMESTAMPDIFF('MINUTE', s.scheduled_start, ar.time_in) / 5.0) * 5 AS INTEGER) AS offset_minutes,
                 COUNT(*) AS total
                FROM attendance_records ar
                JOIN attendance_sessions s ON s.session_id = ar.session_id
               WHERE s.session_date BETWEEN :from AND :to
                 AND ar.time_in IS NOT NULL
-                AND TIMESTAMPDIFF(MINUTE, s.scheduled_start, ar.time_in) BETWEEN -30 AND 60
+                AND TIMESTAMPDIFF('MINUTE', s.scheduled_start, ar.time_in) BETWEEN -30 AND 60
               GROUP BY offset_minutes
               ORDER BY offset_minutes",
             ['from' => $from, 'to' => $to]
@@ -299,15 +301,15 @@ final class AnalyticsService
     public static function monthlyTrend(int $months = 12): array
     {
         return Database::instance()->select(
-            "SELECT DATE_FORMAT(s.session_date, '%Y-%m') AS label,
+            "SELECT strftime('%Y-%m', s.session_date) AS label,
                     COUNT(*) AS total,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage,
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage,
                     SUM(CASE WHEN ar.final_status = 'Late' THEN 1 ELSE 0 END) AS late,
                     SUM(CASE WHEN ar.final_status = 'Absent' THEN 1 ELSE 0 END) AS absent
                FROM attendance_records ar
                JOIN attendance_sessions s ON s.session_id = ar.session_id
-              WHERE s.session_date >= DATE_SUB(CURDATE(), INTERVAL :months MONTH)
+              WHERE s.session_date >= date(CURDATE(), '-' || :months || ' months')
               GROUP BY label
               ORDER BY label",
             ['months' => max(1, min($months, 60))]
@@ -320,14 +322,14 @@ final class AnalyticsService
         return Database::instance()->select(
             'SELECT d.device_id AS label, c.room_number,
                     COUNT(h.heartbeat_id) AS heartbeats,
-                    ROUND(COUNT(h.heartbeat_id)
-                          / NULLIF((:days * 24 * 3600) / NULLIF(d.heartbeat_interval_sec, 0), 0) * 100, 1) AS uptime_percentage,
+                    ROUND(COUNT(h.heartbeat_id) * 100.0
+                          / NULLIF((:days * 24 * 3600) * 1.0 / NULLIF(d.heartbeat_interval_sec, 0), 0), 1) AS uptime_percentage,
                     ROUND(AVG(h.wifi_signal), 0) AS average_signal,
                     MAX(h.queue_depth) AS peak_queue
                FROM devices d
                LEFT JOIN classrooms c ON c.classroom_id = d.classroom_id
                LEFT JOIN device_heartbeats h ON h.device_row_id = d.id
-                    AND h.created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+                    AND h.created_at >= datetime(NOW(), \'-\' || :days || \' days\')
               WHERE d.deleted_at IS NULL AND d.status <> \'decommissioned\'
               GROUP BY d.id, d.device_id, c.room_number, d.heartbeat_interval_sec
               ORDER BY uptime_percentage ASC',
@@ -345,7 +347,7 @@ final class AnalyticsService
                 SUM(CASE WHEN event = 'sync_completed' THEN 1 ELSE 0 END) AS completed,
                 SUM(CASE WHEN event = 'sync_failed' THEN 1 ELSE 0 END) AS failed
                FROM device_logs
-              WHERE created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)",
+              WHERE created_at >= datetime(NOW(), '-' || :days || ' days')",
             ['days' => $days]
         ) ?? [];
 
@@ -354,7 +356,7 @@ final class AnalyticsService
                 SUM(CASE WHEN result = 'verified' THEN 1 ELSE 0 END) AS verified,
                 COUNT(*) AS attempts
                FROM fingerprint_logs
-              WHERE created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+              WHERE created_at >= datetime(NOW(), '-' || :days || ' days')
                 AND result NOT IN ('enrolled','deleted')",
             ['days' => $days]
         ) ?? [];
@@ -364,7 +366,7 @@ final class AnalyticsService
                 SUM(CASE WHEN result = 'accepted' THEN 1 ELSE 0 END) AS accepted,
                 COUNT(*) AS total
                FROM rfid_logs
-              WHERE created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)",
+              WHERE created_at >= datetime(NOW(), '-' || :days || ' days')",
             ['days' => $days]
         ) ?? [];
 
@@ -388,7 +390,7 @@ final class AnalyticsService
         return Database::instance()->select(
             "SELECT result AS label, COUNT(*) AS total
                FROM rfid_logs
-              WHERE created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+              WHERE created_at >= datetime(NOW(), '-' || :days || ' days')
                 AND result <> 'accepted'
               GROUP BY result
               ORDER BY total DESC",
@@ -431,8 +433,8 @@ final class AnalyticsService
                     CONCAT(adv.last_name, ', ', adv.first_name) AS adviser_name,
                     COUNT(*) AS total,
                     SUM(CASE WHEN ar.final_status = 'Absent' THEN 1 ELSE 0 END) AS absences,
-                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END)
-                          / NULLIF(COUNT(*),0) * 100, 1) AS percentage
+                    ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early','Incomplete') THEN 1 ELSE 0 END) * 100.0
+                          / NULLIF(COUNT(*), 0), 1) AS percentage
                FROM attendance_records ar
                JOIN students st     ON st.student_id = ar.student_id
                JOIN sections sec    ON sec.section_id = ar.section_id

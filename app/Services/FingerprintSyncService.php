@@ -724,12 +724,17 @@ final class FingerprintSyncService
         // rather than run as a delete that can match nothing.
         if (self::scope() === 'timetable') {
             $db->execute(
-                "DELETE s FROM fingerprint_slots s
-                   JOIN fingerprint_templates fp ON fp.fingerprint_id = s.fingerprint_id
-                   JOIN devices d                ON d.id = s.device_row_id
-                  WHERE s.device_row_id = :device
-                    AND s.status = 'pending'
-                    AND NOT " . self::scopeCondition('fp.teacher_id', 'd.classroom_id'),
+                // SQLite has no DELETE ... JOIN; the same join picks the rows
+                // to delete inside the subquery instead.
+                "DELETE FROM fingerprint_slots
+                  WHERE slot_row_id IN (
+                        SELECT s.slot_row_id
+                          FROM fingerprint_slots s
+                          JOIN fingerprint_templates fp ON fp.fingerprint_id = s.fingerprint_id
+                          JOIN devices d                ON d.id = s.device_row_id
+                         WHERE s.device_row_id = :device
+                           AND s.status = 'pending'
+                           AND NOT " . self::scopeCondition('fp.teacher_id', 'd.classroom_id') . ')',
                 ['device' => $deviceRowId]
             );
         }

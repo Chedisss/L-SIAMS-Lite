@@ -218,7 +218,7 @@ final class AttendanceService
         $session = $db->selectOne(
             "SELECT * FROM attendance_sessions
               WHERE device_row_id = :device AND status = 'open'
-              LIMIT 1 FOR UPDATE",
+              LIMIT 1",
             ['device' => $deviceRowId]
         );
 
@@ -351,7 +351,7 @@ final class AttendanceService
         $record = $db->selectOne(
             'SELECT * FROM attendance_records
               WHERE session_id = :session AND student_id = :student
-              LIMIT 1 FOR UPDATE',
+              LIMIT 1',
             ['session' => $sessionId, 'student' => $studentId]
         );
 
@@ -801,7 +801,7 @@ final class AttendanceService
             // in this class takes, so a release can never deadlock against a
             // tap arriving for the same student at the same moment.
             $session = $db->selectOne(
-                'SELECT * FROM attendance_sessions WHERE session_id = :id LIMIT 1 FOR UPDATE',
+                'SELECT * FROM attendance_sessions WHERE session_id = :id LIMIT 1',
                 ['id' => $sessionId]
             );
 
@@ -828,7 +828,7 @@ final class AttendanceService
             // attendance_id belonging to another room simply is not found.
             $record = $db->selectOne(
                 'SELECT * FROM attendance_records
-                  WHERE attendance_id = :id AND session_id = :session LIMIT 1 FOR UPDATE',
+                  WHERE attendance_id = :id AND session_id = :session LIMIT 1',
                 ['id' => $attendanceId, 'session' => $sessionId]
             );
 
@@ -1461,11 +1461,11 @@ final class AttendanceService
             $db->execute(
                 'INSERT INTO unknown_rfid_logs (card_uid, device_row_id, session_id, seen_count, first_seen_at, last_seen_at)
                       VALUES (:uid, :device, :session, 1, :now, :now)
-                 ON DUPLICATE KEY UPDATE
+                 ON CONFLICT (card_uid) DO UPDATE SET
                       seen_count = seen_count + 1,
-                      last_seen_at = VALUES(last_seen_at),
-                      device_row_id = VALUES(device_row_id),
-                      session_id = VALUES(session_id)',
+                      last_seen_at = excluded.last_seen_at,
+                      device_row_id = excluded.device_row_id,
+                      session_id = excluded.session_id',
                 ['uid' => $cardUid, 'device' => $deviceRowId, 'session' => $sessionId, 'now' => Clock::nowString()]
             );
 

@@ -146,7 +146,7 @@ final class NotificationService
     {
         return Database::instance()->execute(
             'DELETE FROM notifications
-              WHERE is_read = 1 AND created_at < DATE_SUB(NOW(), INTERVAL :days DAY)',
+              WHERE is_read = 1 AND created_at < datetime(NOW(), \'-\' || :days || \' days\')',
             ['days' => $days]
         );
     }

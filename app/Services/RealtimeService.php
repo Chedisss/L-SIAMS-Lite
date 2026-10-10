@@ -63,7 +63,7 @@ final class RealtimeService
             $db->execute(
                 'INSERT INTO realtime_channel_cursors (channel, last_sequence)
                       VALUES (:channel, 1)
-                 ON DUPLICATE KEY UPDATE last_sequence = last_sequence + 1',
+                 ON CONFLICT (channel) DO UPDATE SET last_sequence = last_sequence + 1',
                 ['channel' => $channel]
             );
 
@@ -388,7 +388,7 @@ final class RealtimeService
     public static function purgeOldEvents(int $hours): int
     {
         return Database::instance()->execute(
-            'DELETE FROM realtime_events WHERE created_at < DATE_SUB(NOW(), INTERVAL :hours HOUR)',
+            'DELETE FROM realtime_events WHERE created_at < datetime(NOW(), \'-\' || :hours || \' hours\')',
             ['hours' => $hours]
         );
     }
@@ -396,7 +396,7 @@ final class RealtimeService
     public static function purgeExpiredTickets(): int
     {
         return Database::instance()->execute(
-            'DELETE FROM realtime_tickets WHERE expires_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)'
+            'DELETE FROM realtime_tickets WHERE expires_at < datetime(NOW(), \'-1 hours\')'
         );
     }
 }

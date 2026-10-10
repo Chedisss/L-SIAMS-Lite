@@ -259,7 +259,12 @@ final class TeacherSectionAssignmentValidator
                 AND sch.status = \'active\'
                 AND sch.deleted_at IS NULL
                 AND sec.grade_level_id NOT IN (' . implode(',', $placeholders) . ')
-              ORDER BY gl.numeric_level, sch.day_of_week, sch.start_time',
+              ORDER BY gl.numeric_level,
+                       -- Week order, as the ENUM sorted in MariaDB; as text it
+                       -- would sort alphabetically.
+                       FIELD(sch.day_of_week, \'Monday\', \'Tuesday\', \'Wednesday\', \'Thursday\',
+                             \'Friday\', \'Saturday\', \'Sunday\'),
+                       sch.start_time',
             $bindings
         );
     }

@@ -170,8 +170,7 @@ final class FingerprintEnrollmentService
               LEFT JOIN teachers t ON t.teacher_id = r.teacher_id
                   WHERE r.device_row_id = :device
                     AND r.status IN ('pending','scanning')
-                  ORDER BY r.request_id DESC LIMIT 1
-                    FOR UPDATE",
+                  ORDER BY r.request_id DESC LIMIT 1",
                 ['device' => $deviceRowId]
             );
 
@@ -333,8 +332,7 @@ final class FingerprintEnrollmentService
               LEFT JOIN teachers t ON t.teacher_id = r.teacher_id
                   WHERE r.device_row_id = :device
                     AND r.status IN ('pending','scanning')
-                  ORDER BY r.request_id ASC LIMIT 1
-                    FOR UPDATE",
+                  ORDER BY r.request_id ASC LIMIT 1",
                 ['device' => $deviceRowId]
             );
 
@@ -543,7 +541,7 @@ final class FingerprintEnrollmentService
         $db = Database::instance();
 
         $request = $db->selectOne(
-            'SELECT * FROM fingerprint_enrollment_requests WHERE request_id = :id FOR UPDATE',
+            'SELECT * FROM fingerprint_enrollment_requests WHERE request_id = :id',
             ['id' => $requestId]
         );
 

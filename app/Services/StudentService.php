@@ -168,7 +168,7 @@ final class StudentService
 
         $db->transaction(static function (Database $db) use ($studentId, $toSectionId, $reason, $effectiveDate, $userId): void {
             $student = $db->selectOne(
-                'SELECT * FROM students WHERE student_id = :id FOR UPDATE',
+                'SELECT * FROM students WHERE student_id = :id',
                 ['id' => $studentId]
             );
 
@@ -186,7 +186,7 @@ final class StudentService
                 'SELECT sec.*, gl.grade_level_name
                    FROM sections sec
                    JOIN grade_levels gl ON gl.grade_level_id = sec.grade_level_id
-                  WHERE sec.section_id = :id AND sec.deleted_at IS NULL FOR UPDATE',
+                  WHERE sec.section_id = :id AND sec.deleted_at IS NULL',
                 ['id' => $toSectionId]
             );
 
@@ -271,7 +271,7 @@ final class StudentService
     private static function syncSubjectEnrolments(Database $db, int $studentId, int $sectionId): void
     {
         $db->execute(
-            'INSERT IGNORE INTO student_subject_enrolments
+            'INSERT OR IGNORE INTO student_subject_enrolments
                  (student_id, subject_id, section_id, school_year_id, status, created_at, updated_at)
              SELECT :student, sch.subject_id, :section, sch.school_year_id, \'enrolled\', :now, :now
                FROM schedules sch
@@ -488,11 +488,11 @@ final class StudentService
             "SELECT st.*, sec.section_code, sec.section_name, gl.grade_level_id,
                     gl.grade_level_code, gl.grade_level_name, gl.numeric_level,
                     rc.card_uid, rc.rfid_id, rc.status AS rfid_status,
-                    (SELECT ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early') THEN 1 ELSE 0 END)
-                                  / NULLIF(COUNT(*), 0) * 100, 1)
+                    (SELECT ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early') THEN 1 ELSE 0 END) * 100.0
+                                  / NULLIF(COUNT(*), 0), 1)
                        FROM attendance_records ar
                       WHERE ar.student_id = st.student_id
-                        AND ar.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)) AS attendance_percentage
+                        AND ar.created_at >= datetime(NOW(), '-30 days')) AS attendance_percentage
              {$base}
              ORDER BY {$orderBy} {$direction}, st.student_id
              LIMIT " . max(1, $perPage) . ' OFFSET ' . max(0, ($page - 1) * $perPage),
@@ -534,7 +534,7 @@ final class StudentService
                 SUM(CASE WHEN final_status = 'Excused' THEN 1 ELSE 0 END) AS excused,
                 AVG(duration_minutes) AS avg_dwell
                FROM attendance_records
-              WHERE student_id = :id AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)",
+              WHERE student_id = :id AND created_at >= datetime(NOW(), '-' || :days || ' days')",
             ['id' => $studentId, 'days' => $days]
         ) ?? [];
 

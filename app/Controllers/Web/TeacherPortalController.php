@@ -450,7 +450,7 @@ final class TeacherPortalController extends Controller
                FROM attendance_sessions s
                LEFT JOIN attendance_records ar ON ar.session_id = s.session_id
               WHERE s.teacher_id = :teacher
-                AND s.session_date >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)",
+                AND s.session_date >= date(CURDATE(), '-90 days')",
             ['teacher' => $teacherId]
         ) ?? [];
 

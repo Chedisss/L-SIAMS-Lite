@@ -292,7 +292,7 @@ final class AcademicStructureService
                FROM attendance_records ar
                JOIN subjects s ON s.subject_id = ar.subject_id
               WHERE s.department_id = :id
-                AND ar.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+                AND ar.created_at >= datetime(NOW(), '-30 days')",
             ['id' => $departmentId]
         ) ?? [];
 
@@ -424,7 +424,7 @@ final class AcademicStructureService
 
         if ($adviserId !== null) {
             $db->execute(
-                'INSERT IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
+                'INSERT OR IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
                 ['t' => $adviserId, 's' => $sectionId, 'u' => $userId]
             );
         }
@@ -505,7 +505,7 @@ final class AcademicStructureService
 
         if ($adviserId !== null) {
             $db->execute(
-                'INSERT IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
+                'INSERT OR IGNORE INTO teacher_sections (teacher_id, section_id, assigned_by) VALUES (:t, :s, :u)',
                 ['t' => $adviserId, 's' => $sectionId, 'u' => $userId]
             );
         }
@@ -771,11 +771,11 @@ final class AcademicStructureService
             "SELECT st.student_id, st.student_number, st.first_name, st.last_name, st.middle_name,
                     st.photo_path, st.status, st.guardian_name, st.guardian_contact,
                     rc.card_uid, rc.status AS rfid_status, rc.issue_date,
-                    (SELECT ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early') THEN 1 ELSE 0 END)
-                                  / NULLIF(COUNT(*),0) * 100, 1)
+                    (SELECT ROUND(SUM(CASE WHEN ar.final_status IN ('Present','Late','Left Early') THEN 1 ELSE 0 END) * 100.0
+                                  / NULLIF(COUNT(*), 0), 1)
                        FROM attendance_records ar
                       WHERE ar.student_id = st.student_id
-                        AND ar.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)) AS attendance_percentage
+                        AND ar.created_at >= datetime(NOW(), '-30 days')) AS attendance_percentage
                FROM students st
                LEFT JOIN rfid_cards rc ON rc.student_id = st.student_id AND rc.status = 'active'
               WHERE st.section_id = :id AND st.deleted_at IS NULL
@@ -883,9 +883,10 @@ final class AcademicStructureService
             // true at all times rather than only at assignment time.
             if ($newDepartmentId !== (int) $existing['department_id']) {
                 $db->execute(
-                    'DELETE ts FROM teacher_subjects ts
-                       JOIN teachers t ON t.teacher_id = ts.teacher_id
-                      WHERE ts.subject_id = :s AND t.department_id <> :d AND ts.is_exception = 0',
+                    'DELETE FROM teacher_subjects
+                      WHERE subject_id = :s
+                        AND is_exception = 0
+                        AND teacher_id IN (SELECT teacher_id FROM teachers WHERE department_id <> :d)',
                     ['s' => $subjectId, 'd' => $newDepartmentId]
                 );
             }
@@ -1162,17 +1163,21 @@ final class AcademicStructureService
 
         return Database::instance()->select(
             'SELECT s.*, d.department_name, d.department_code,
-                    (SELECT GROUP_CONCAT(gl.grade_level_code ORDER BY gl.numeric_level SEPARATOR ", ")
-                       FROM subject_grade_levels sgl
-                       JOIN grade_levels gl ON gl.grade_level_id = sgl.grade_level_id
-                      WHERE sgl.subject_id = s.subject_id) AS grade_levels,
+                    (SELECT group_concat(o.grade_level_code, \', \')
+                       FROM (SELECT gl.grade_level_code
+                               FROM subject_grade_levels sgl
+                               JOIN grade_levels gl ON gl.grade_level_id = sgl.grade_level_id
+                              WHERE sgl.subject_id = s.subject_id
+                              ORDER BY gl.numeric_level) AS o) AS grade_levels,
                     -- The numbers as well as the codes, so the view can collapse
                     -- a run into "G1-G6" instead of printing six labels that
                     -- push the table past the width of the screen.
-                    (SELECT GROUP_CONCAT(gl.numeric_level ORDER BY gl.numeric_level)
-                       FROM subject_grade_levels sgl
-                       JOIN grade_levels gl ON gl.grade_level_id = sgl.grade_level_id
-                      WHERE sgl.subject_id = s.subject_id) AS grade_level_numbers,
+                    (SELECT group_concat(o.numeric_level, \',\')
+                       FROM (SELECT gl.numeric_level
+                               FROM subject_grade_levels sgl
+                               JOIN grade_levels gl ON gl.grade_level_id = sgl.grade_level_id
+                              WHERE sgl.subject_id = s.subject_id
+                              ORDER BY gl.numeric_level) AS o) AS grade_level_numbers,
                     (SELECT COUNT(*) FROM teacher_subjects ts WHERE ts.subject_id = s.subject_id) AS teacher_count
                FROM subjects s
                JOIN departments d ON d.department_id = s.department_id
@@ -1229,7 +1234,7 @@ final class AcademicStructureService
 
         foreach ($wanted as $gradeLevelId) {
             $db->execute(
-                'INSERT IGNORE INTO subject_grade_levels (subject_id, grade_level_id) VALUES (:s, :g)',
+                'INSERT OR IGNORE INTO subject_grade_levels (subject_id, grade_level_id) VALUES (:s, :g)',
                 ['s' => $subjectId, 'g' => $gradeLevelId]
             );
         }
