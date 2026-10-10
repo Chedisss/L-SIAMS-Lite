@@ -1,0 +1,41 @@
+# ---------------------------------------------------------------------------
+# Apache configuration for the L-SIAMS document root.
+# Nginx equivalents live in docs/DEPLOYMENT.md.
+# ---------------------------------------------------------------------------
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Force HTTPS. Attendance APIs must never be reachable over plaintext.
+    RewriteCond %{HTTPS} off
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+    # Serve existing files (assets, uploads) directly.
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always unset X-Powered-By
+    Header always unset Server
+</IfModule>
+
+# Uploaded files are data, never code — see public/uploads/.htaccess, which is
+# where that rule now lives.
+#
+# It cannot live here. <Directory> is a server-config and virtual-host
+# directive; Apache refuses it inside .htaccess and answers the request with
+# 500 Internal Server Error. The block sat here unnoticed for as long as the
+# system was served by PHP's built-in server, which ignores .htaccess
+# altogether, and failed the moment Apache took over.
+
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
+Options -Indexes -ExecCGI

@@ -1,0 +1,4688 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * L-SIAMS command line console.
+ *
+ *   php bin/console key:generate         Generate APP_KEY / API_KEY_PEPPER / ticket secret
+ *   php bin/console migrate              Apply pending migrations
+ *   php bin/console migrate:status       Show which migrations have run
+ *   php bin/console migrate:fresh        Drop everything and re-migrate (destructive)
+ *   php bin/console seed [--demo]        Seed reference data (and optional demo data)
+ *   php bin/console install              key:generate + migrate + seed, in one step
+ *   php bin/console worker               Maintenance worker (sessions, heartbeats, auto-close)
+ *   php bin/console backup               Create an encrypted backup now
+ *   php bin/console security:audit-keys  Static check that no weak RNG is in the key path
+ *   php bin/console doctor               Diagnose a running installation
+ *   php bin/console db:import <file>     Replace the database with a SQLite .sql dump
+ *   php bin/console time:shift "+2 hours" Move the clock for schedule testing
+ *   php bin/console user:create-admin    Create an administrator interactively
+ *   php bin/console user:create-teachers Issue logins to teachers who have none
+ */
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "This script must be run from the command line.\n");
+    exit(1);
+}
+
+/** @var App\Core\App $app */
+$app = require dirname(__DIR__) . '/bootstrap.php';
+
+use App\Core\Clock;
+use App\Core\Config;
+use App\Core\Crypto;
+use App\Core\Database;
+use App\Core\Env;
+use App\Core\Hash;
+use App\Services\ApiKeyService;
+use App\Services\AttendanceSessionService;
+use App\Services\BackupService;
+use App\Services\SettingsService;
+use App\Services\DeviceService;
+use App\Services\IdempotencyService;
+use App\Services\NotificationService;
+use App\Services\RealtimeService;
+use App\Services\ScheduleService;
+use App\Services\SchoolYearService;
+use App\Services\SessionService;
+use App\Services\StudentService;
+use App\Services\TlsCertificateService;
+
+$command   = $argv[1] ?? 'help';
+$arguments = array_slice($argv, 2);
+$flags     = array_values(array_filter($arguments, static fn (string $a): bool => str_starts_with($a, '--')));
+
+function out(string $message = '', string $colour = ''): void
+{
+    $colours = [
+        'red' => "\033[31m", 'green' => "\033[32m", 'yellow' => "\033[33m",
+        'blue' => "\033[34m", 'cyan' => "\033[36m", 'grey' => "\033[90m", 'bold' => "\033[1m",
+    ];
+
+    $prefix = $colours[$colour] ?? '';
+    $suffix = $prefix === '' ? '' : "\033[0m";
+
+    fwrite(STDOUT, $prefix . $message . $suffix . PHP_EOL);
+}
+
+function fail(string $message): never
+{
+    out('✗ ' . $message, 'red');
+    exit(1);
+}
+
+function ok(string $message): void
+{
+    out('✓ ' . $message, 'green');
+}
+
+function heading(string $message): void
+{
+    out('');
+    out($message, 'bold');
+    out(str_repeat('─', min(70, strlen($message))), 'grey');
+}
+
+function prompt(string $question, bool $hidden = false): string
+{
+    fwrite(STDOUT, $question . ': ');
+
+    if ($hidden && DIRECTORY_SEPARATOR !== '\\') {
+        @shell_exec('stty -echo 2>/dev/null');
+        $value = trim((string) fgets(STDIN));
+        @shell_exec('stty echo 2>/dev/null');
+        fwrite(STDOUT, PHP_EOL);
+
+        return $value;
+    }
+
+    return trim((string) fgets(STDIN));
+}
+
+// ---------------------------------------------------------------------------
+
+try {
+    match ($command) {
+        'key:generate'        => commandKeyGenerate($flags),
+        'migrate'             => commandMigrate(),
+        'migrate:rechecksum'  => commandMigrateRechecksum($flags),
+        'migrate:status'      => commandMigrateStatus(),
+        'migrate:fresh'       => commandMigrateFresh($flags),
+        'seed'                => commandSeed($flags),
+        'schedule:grade3'     => commandScheduleGradeThree($flags),
+        'schedule:mirror'     => commandScheduleMirror($flags),
+        'install'             => commandInstall($flags),
+        'worker'              => commandWorker($arguments),
+        'backup'              => commandBackup(),
+        'security:audit-keys' => commandAuditKeys(),
+        'security:privileges' => commandAuditPrivileges(),
+        'tls:generate'        => commandTlsGenerate($arguments, $flags),
+        'tls:apache'          => commandTlsApache($arguments, $flags),
+        'doctor'              => commandDoctor(),
+        'db:import'           => commandDbImport($arguments, $flags),
+        'db:import-mysql'     => commandDbImportMysql($arguments, $flags),
+        'backup:decrypt'      => commandBackupDecrypt($arguments),
+        'time:shift'          => commandTimeShift($arguments, $flags),
+        'schema:dump'         => commandSchemaDump(),
+        'user:create-admin'   => commandCreateAdmin(),
+        'user:create-teachers' => commandCreateTeacherAccounts($flags),
+        'user:purge'          => commandUserPurge($arguments, $flags),
+        'session:why'         => commandSessionWhy($arguments),
+        'device:unblock'      => commandDeviceUnblock($arguments, $flags),
+        'fingerprint:reset'   => commandFingerprintReset($flags),
+        'students:sample'     => commandSampleStudents($flags),
+        'rfid:release'        => commandRfidRelease($flags),
+        default               => commandHelp(),
+    };
+} catch (Throwable $e) {
+    out('');
+    fail($e->getMessage() . "\n  at " . $e->getFile() . ':' . $e->getLine());
+}
+
+// ---------------------------------------------------------------------------
+
+function commandHelp(): void
+{
+    out('');
+    out('  L-SIAMS console', 'bold');
+    out('  Local IoT-Based Multi-Layer Secured Attendance Monitoring System', 'grey');
+    out('');
+    out('  Setup', 'cyan');
+    out('    install                 Generate keys, migrate and seed in one step');
+    out('    key:generate            Generate cryptographic keys into .env');
+    out('    migrate                 Apply pending migrations');
+    out('    migrate:status          Show migration state');
+    out('    migrate:fresh --force   Drop all tables and re-migrate (destructive)');
+    out('    migrate:rechecksum      Accept applied migration files whose bytes changed');
+    out('    seed [--demo]           Seed reference data, optionally with demo records');
+    out('    schedule:grade3         Build the Grade 3 - Gold week (--room=101 --section=G3-S1)');
+    out('    schedule:mirror         Copy a section\'s week to another, rotated (--from= --to= --room=)');
+    out('    user:create-admin       Create an administrator account interactively');
+    out('    user:create-teachers    Give every teacher without a login one (--yes to skip asking)');
+    out('    user:purge <id>         Erase a user and their history (destructive, last resort)');
+    out('    fingerprint:reset       Erase every enrolment and every sensor, to start over');
+    out('    rfid:release            Free cards held by students who have left, for re-issue');
+    out('    students:sample         Enrol sample students (--section=G3-S1 --count=10)');
+    out('');
+    out('  Operations', 'cyan');
+    out('    worker [--once]         Maintenance loop: sessions, heartbeats, retention');
+    out('    backup                  Create an encrypted database backup');
+    out('    security:audit-keys     Verify no weak RNG exists in the key path');
+    out('    security:privileges     Verify the database refuses to delete or rewrite history');
+    out('    doctor                  Diagnose this installation and report problems');
+    out('    session:why [device]    Explain why a terminal will not open a session now');
+    out('    device:unblock [device]  Show who is rate limited, and lift it (--all)');
+    out('    schema:dump             Write database/lsiams_schema.sql (schema + reference data)');
+    out('    db:import <file.sql>    Replace the database with a SQLite .sql dump (--force)');
+    out('    db:import-mysql         Copy the MariaDB version\'s data in (--from-file=<dump or backup>)');
+    out('    backup:decrypt <file>   Turn a backup archive back into readable SQL');
+    out('    time:shift ["+2 hours"]  Move the clock to test a schedule (--clear to undo)');
+    out('');
+    out('  HTTPS', 'cyan');
+    out('    tls:generate            Issue the server certificate (--host= --ip= --new-ca)');
+    out('    tls:apache              Write the Apache configuration that serves it');
+    out('');
+}
+
+/**
+ * Generate the three secrets the application needs, writing them into .env.
+ * Existing values are never overwritten without --force: doing so would make
+ * every stored HMAC secret and every live session permanently unreadable.
+ */
+function commandKeyGenerate(array $flags): void
+{
+    heading('Generating cryptographic keys');
+
+    $envFile = BASE_PATH . '/.env';
+
+    if (!is_file($envFile)) {
+        if (!is_file(BASE_PATH . '/.env.example')) {
+            fail('Neither .env nor .env.example exists.');
+        }
+
+        copy(BASE_PATH . '/.env.example', $envFile);
+        @chmod($envFile, 0600);
+        ok('Created .env from .env.example');
+    }
+
+    $contents = (string) file_get_contents($envFile);
+    $force    = in_array('--force', $flags, true);
+    $written  = 0;
+
+    // Is there already encrypted data that a new APP_KEY would orphan?
+    //
+    // The guarded case is obvious and handled below: a key that is present is
+    // skipped unless --force. The unguarded one is the dangerous one, because
+    // it does not look like a key change at all — .env goes missing, or is
+    // moved aside, and start.bat recreates it and calls this command. Every
+    // value is then "absent", so fresh keys are generated with no warning and
+    // the message on screen reads "First run - setting up".
+    //
+    // It is not a first run. The database is still full, and every terminal
+    // secret and fingerprint template in it has just become unreadable —
+    // permanently, because the key that opened them is the file that went
+    // missing. That is the single most destructive thing this project can do
+    // to itself, and until now it did it quietly.
+    //
+    // The database may legitimately not exist yet on a real first run, so a
+    // failure to look is not an error: it means there is nothing to lose.
+    $existingSecrets = 0;
+
+    try {
+        $probe = Database::instance();
+        $existingSecrets = (int) $probe->scalar(
+            "SELECT COUNT(*) FROM api_keys
+              WHERE hmac_secret_encrypted IS NOT NULL AND status = 'active'"
+        );
+
+        if ($probe->hasColumn('fingerprint_templates', 'template_data')) {
+            $existingSecrets += (int) $probe->scalar(
+                'SELECT COUNT(*) FROM fingerprint_templates WHERE template_data IS NOT NULL'
+            );
+        }
+    } catch (Throwable $e) {
+        $existingSecrets = 0;      // no reachable database, so nothing at risk
+    }
+
+    $appKeySet = preg_match('/^APP_KEY=(.+)$/m', $contents, $m) === 1 && trim($m[1]) !== '';
+    $withheld  = $existingSecrets > 0 && !$appKeySet && !$force;
+
+    // The refusal below is right, but it used to fail() before writing
+    // anything — so an installation that hit it was left with NO keys rather
+    // than one missing key, and doctor reported all three unset. Only two of
+    // them can orphan data:
+    //
+    //   APP_KEY         opens terminal secrets and fingerprint templates
+    //   API_KEY_PEPPER  hashes API keys; a new one invalidates every device key
+    //
+    // REALTIME_TICKET_SECRET signs short-lived realtime tickets and nothing
+    // stored depends on it, so withholding it protected nothing and only made
+    // the installation look more broken than it was. It is written either way.
+    $atRisk = ['APP_KEY', 'API_KEY_PEPPER'];
+
+    if ($withheld) {
+        out('');
+        out('  ✗ Refusing to generate a new APP_KEY.', 'red');
+        out('');
+        out(sprintf('  This database already holds %d encrypted value(s) — terminal secrets', $existingSecrets), 'yellow');
+        out('  and fingerprint templates — and .env has no APP_KEY to read them with.', 'yellow');
+        out('');
+        out('  Generating one now would not recover them. It would replace the key they', 'grey');
+        out('  were encrypted with, permanently, and every terminal would stop', 'grey');
+        out('  authenticating while every enrolled fingerprint stopped matching.', 'grey');
+        out('');
+        out('  The original .env is what opens this data. Look for it before doing', 'grey');
+        out('  anything else — a backup, the machine this database came from, or a', 'grey');
+        out('  copy taken before the move. See docs/MOVING-TO-ANOTHER-PC.md', 'grey');
+        out('');
+        out('  If it is genuinely gone, --force generates a new key and accepts the', 'grey');
+        out('  loss: re-issue every terminal\'s provisioning file and enrol every', 'grey');
+        out('  fingerprint again. Nothing else in the database is affected.', 'grey');
+        out('');
+        out('  APP_KEY and API_KEY_PEPPER are being withheld. REALTIME_TICKET_SECRET', 'grey');
+        out('  is written below — nothing stored depends on it, so it carries no risk.', 'grey');
+        out('');
+    }
+
+    foreach (['APP_KEY', 'API_KEY_PEPPER', 'REALTIME_TICKET_SECRET'] as $name) {
+        if ($withheld && in_array($name, $atRisk, true)) {
+            out('  ' . $name . ' withheld — see above (use --force only if the original .env is gone)', 'yellow');
+            continue;
+        }
+
+        $hasValue = preg_match('/^' . $name . '=(.+)$/m', $contents, $matches) === 1
+            && trim($matches[1]) !== '';
+
+        if ($hasValue && !$force) {
+            out('  ' . $name . ' already set — skipping (use --force to replace)', 'grey');
+            continue;
+        }
+
+        if ($hasValue && $force) {
+            out('  ⚠ Replacing ' . $name . ' — encrypted HMAC secrets and live sessions will be invalidated.', 'yellow');
+        }
+
+        $value = base64_encode(Crypto::randomBytes(32));
+
+        $contents = preg_match('/^' . $name . '=.*$/m', $contents) === 1
+            ? (string) preg_replace('/^' . $name . '=.*$/m', $name . '=' . $value, $contents)
+            : $contents . PHP_EOL . $name . '=' . $value;
+
+        ok($name . ' generated (256-bit CSPRNG)');
+        $written++;
+    }
+
+    file_put_contents($envFile, $contents);
+    @chmod($envFile, 0600);
+
+    if ($written > 0) {
+        out('');
+        out('  .env permissions set to 0600. Keep this file out of version control.', 'grey');
+    }
+
+    // Non-zero, so start.bat and update.bat stop rather than launching a
+    // system that cannot encrypt anything. The two withheld keys are the whole
+    // point: this is not a partial success to be shrugged off.
+    if ($withheld) {
+        out('');
+        fail('APP_KEY generation refused — run with --force only if the original .env is gone.');
+    }
+}
+
+/** @return list<array{name:string,path:string,checksum:string}> */
+function discoverMigrations(): array
+{
+    return App\Services\MigrationService::discover();
+}
+
+function ensureMigrationsTable(Database $db): void
+{
+    App\Services\MigrationService::ensureTable($db);
+}
+
+function commandMigrate(): void
+{
+    heading('Running migrations');
+
+    $db = Database::instance();
+    ensureMigrationsTable($db);
+
+    $applied = [];
+
+    foreach ($db->select('SELECT migration, checksum FROM schema_migrations') as $row) {
+        $applied[(string) $row['migration']] = (string) $row['checksum'];
+    }
+
+    $batch    = (int) $db->scalar('SELECT COALESCE(MAX(batch), 0) + 1 FROM schema_migrations');
+    $pending  = 0;
+    $drifted  = [];
+
+    foreach (discoverMigrations() as $migration) {
+        if (isset($applied[$migration['name']])) {
+            // A changed checksum usually means the file's newlines changed on
+            // checkout, not that anybody edited it — the checksum is over the
+            // bytes. .gitattributes pins *.sql to LF so this stops happening,
+            // but a database that recorded a checksum before that pin keeps
+            // reporting the difference for ever.
+            //
+            // So the wording says what it is and what to do. "Has changed
+            // since it was applied", alone and repeated across a screen, reads
+            // as an alarm nobody can act on — and teaches people to scroll
+            // past the one that matters.
+            if ($applied[$migration['name']] !== $migration['checksum']) {
+                $drifted[] = $migration['name'];
+            }
+            continue;
+        }
+
+        out('  → ' . $migration['name'], 'cyan');
+
+        $sql = (string) file_get_contents($migration['path']);
+
+        try {
+            runMigration($db, $sql, [
+                'migration' => $migration['name'],
+                'batch'     => $batch,
+                'checksum'  => $migration['checksum'],
+            ]);
+        } catch (Throwable $e) {
+            fail($migration['name'] . ' failed, and nothing it did was kept: ' . $e->getMessage());
+        }
+
+        ok('  ' . $migration['name']);
+        $pending++;
+    }
+
+    out('');
+    $pending === 0 ? ok('Database is already up to date.') : ok($pending . ' migration(s) applied.');
+
+    // Reported once, at the end, after the thing people came here to read.
+    if ($drifted !== []) {
+        out('');
+        out(sprintf(
+            '  Note: %d already-applied migration file(s) no longer match the checksum recorded',
+            count($drifted)
+        ), 'grey');
+        out('  when they ran. Almost always this is newline translation on checkout rather than', 'grey');
+        out('  an edit, and it is harmless — those changes are already in the database. If you', 'grey');
+        out('  did edit one, write a new migration instead; editing an applied one does nothing.', 'grey');
+        out('  Clear the note with: console.bat migrate:rechecksum', 'grey');
+    }
+}
+
+/**
+ * Re-record the checksums of migrations that have already run.
+ *
+ * Needed because the checksum is over the file's bytes, so a checkout that
+ * changes newlines changes it — and every already-applied migration then
+ * reports a difference for ever, on every run, burying any real one.
+ *
+ * This deliberately cannot run anything or change the schema. It only says
+ * "the file as it stands now is the one that produced this database", which is
+ * a statement only somebody who has looked can make — so it prints what it is
+ * about to accept and asks.
+ */
+function commandMigrateRechecksum(array $flags): void
+{
+    $db      = Database::instance();
+    $applied = [];
+
+    foreach ($db->select('SELECT migration, checksum FROM schema_migrations') as $row) {
+        $applied[(string) $row['migration']] = (string) $row['checksum'];
+    }
+
+    $drifted = [];
+
+    foreach (discoverMigrations() as $migration) {
+        if (isset($applied[$migration['name']]) && $applied[$migration['name']] !== $migration['checksum']) {
+            $drifted[] = $migration;
+        }
+    }
+
+    heading('Re-record migration checksums');
+
+    if ($drifted === []) {
+        ok('Every applied migration already matches its file. Nothing to do.');
+
+        return;
+    }
+
+    out('  These files differ from the checksum recorded when they ran:', 'yellow');
+    out('');
+
+    foreach ($drifted as $migration) {
+        out('    ' . $migration['name'], 'grey');
+    }
+
+    out('');
+    out('  Re-recording accepts each file as it stands now. It runs nothing and', 'grey');
+    out('  changes no table — if one of these was genuinely edited, the edit is', 'grey');
+    out('  still not in the database and still needs its own migration.', 'grey');
+    out('');
+
+    if (!in_array('--force', $flags, true)) {
+        fail('Re-run with --force to accept them.');
+    }
+
+    foreach ($drifted as $migration) {
+        $db->execute(
+            'UPDATE schema_migrations SET checksum = :checksum WHERE migration = :migration',
+            ['checksum' => $migration['checksum'], 'migration' => $migration['name']]
+        );
+    }
+
+    ok(sprintf('%d checksum(s) re-recorded.', count($drifted)));
+}
+
+/** @param array{migration:string,batch:int,checksum:string} $record */
+function runMigration(Database $db, string $sql, array $record): void
+{
+    App\Services\MigrationService::run($db, $sql, $record);
+}
+
+function commandMigrateStatus(): void
+{
+    heading('Migration status');
+
+    $db = Database::instance();
+    ensureMigrationsTable($db);
+
+    $applied = [];
+
+    foreach ($db->select('SELECT migration, batch, applied_at FROM schema_migrations') as $row) {
+        $applied[(string) $row['migration']] = $row;
+    }
+
+    foreach (discoverMigrations() as $migration) {
+        if (isset($applied[$migration['name']])) {
+            out(sprintf('  %-52s applied  %s', $migration['name'], $applied[$migration['name']]['applied_at']), 'green');
+        } else {
+            out(sprintf('  %-52s pending', $migration['name']), 'yellow');
+        }
+    }
+}
+
+function commandMigrateFresh(array $flags): void
+{
+    if (!in_array('--force', $flags, true)) {
+        fail('migrate:fresh destroys all data. Re-run with --force to confirm.');
+    }
+
+    heading('Dropping all tables');
+
+    $db  = Database::instance();
+    $pdo = $db->pdo();
+    $pdo->exec('PRAGMA foreign_keys = OFF');
+
+    // Views and triggers first, since they name the tables; then the tables.
+    foreach (['view', 'trigger', 'table'] as $type) {
+        $names = $db->select(
+            "SELECT name FROM sqlite_master WHERE type = :type AND name NOT LIKE 'sqlite_%'",
+            ['type' => $type]
+        );
+
+        foreach ($names as $row) {
+            $pdo->exec(sprintf('DROP %s IF EXISTS "%s"', strtoupper($type), str_replace('"', '""', (string) $row['name'])));
+
+            if ($type === 'table') {
+                out('  dropped ' . $row['name'], 'grey');
+            }
+        }
+    }
+
+    $pdo->exec('PRAGMA foreign_keys = ON');
+    // Give the space back: an emptied SQLite file keeps its size otherwise.
+    $pdo->exec('VACUUM');
+    $db->forgetPendingMigrations();
+    ok('Schema dropped.');
+
+    commandMigrate();
+}
+
+function commandSeed(array $flags): void
+{
+    heading('Seeding');
+
+    $seeders = [
+        BASE_PATH . '/database/seeders/ReferenceSeeder.php',
+    ];
+
+    if (in_array('--demo', $flags, true)) {
+        $seeders[] = BASE_PATH . '/database/seeders/DemoSeeder.php';
+    }
+
+    foreach ($seeders as $file) {
+        if (!is_file($file)) {
+            out('  skipped (missing) ' . basename($file), 'grey');
+            continue;
+        }
+
+        out('  → ' . basename($file), 'cyan');
+        $result = require $file;
+
+        if (is_callable($result)) {
+            $result(Database::instance());
+        }
+    }
+
+    ok('Seeding complete.');
+}
+
+function commandInstall(array $flags): void
+{
+    out('');
+    out('  L-SIAMS installation', 'bold');
+    out('');
+
+    commandKeyGenerate($flags);
+
+    // Config is read once at boot, so the freshly written keys need re-reading
+    // before anything tries to encrypt with them.
+    App\Core\Env::load(BASE_PATH . '/.env');
+
+    commandMigrate();
+    commandSeed($flags);
+
+    heading('Next steps');
+    out('  1. Create an administrator:   php bin/console user:create-admin');
+    out('  2. Start the realtime server: php realtime/server.php');
+    out('  3. Schedule the worker:       php bin/console worker');
+    out('  4. Sign in and register your classrooms, sections and terminals.');
+    out('');
+}
+
+/**
+ * Maintenance worker.
+ *
+ * Everything time-driven in the system lives here: sessions that must close,
+ * devices that stopped talking, and the retention sweeps. Run it from cron
+ * (every minute) or as a long-lived service.
+ */
+function commandWorker(array $arguments): void
+{
+    $once     = in_array('--once', $arguments, true);
+    $interval = 60;
+
+    foreach ($arguments as $argument) {
+        if (str_starts_with($argument, '--interval=')) {
+            $interval = max(10, (int) substr($argument, 11));
+        }
+    }
+
+    out('');
+    out('  L-SIAMS maintenance worker' . ($once ? ' (single pass)' : ' (every ' . $interval . 's)'), 'bold');
+    out('  Press Ctrl+C to stop.', 'grey');
+    out('');
+
+    $tick = 0;
+
+    do {
+        $tick++;
+        $started = microtime(true);
+
+        try {
+            $closed = AttendanceSessionService::autoCloseExpired();
+            if ($closed > 0) {
+                out(sprintf('[%s] closed %d expired session(s)', date('H:i:s'), $closed), 'cyan');
+            }
+
+            $expiring = AttendanceSessionService::notifyExpiringSessions(5);
+            if ($expiring > 0) {
+                out(sprintf('[%s] warned %d session(s) about closing soon', date('H:i:s'), $expiring), 'grey');
+            }
+
+            $offline = DeviceService::markStaleDevicesOffline();
+            if ($offline > 0) {
+                out(sprintf('[%s] marked %d device(s) offline', date('H:i:s'), $offline), 'yellow');
+            }
+
+            $sessions = SessionService::expireStaleSessions();
+            if ($sessions > 0) {
+                out(sprintf('[%s] expired %d web session(s)', date('H:i:s'), $sessions), 'grey');
+            }
+
+            $graced = ApiKeyService::expireGracePeriods();
+            if ($graced > 0) {
+                out(sprintf('[%s] auto-revoked %d rotated key(s)', date('H:i:s'), $graced), 'yellow');
+            }
+
+            // The scheduled backup.
+            //
+            // backup.schedule_enabled, backup.schedule_time and
+            // backup.retain_count were written by the seeder and read by
+            // nothing at all — the Settings panel offered "Automatic daily
+            // backup", a time and a retention count, and no code anywhere
+            // acted on any of it. A backup setting that silently does nothing
+            // is worse than not offering one, because somebody stops taking
+            // manual backups.
+            //
+            // Checked every tick, acted on once a day: the guard is whether a
+            // scheduled backup already exists for today, which survives the
+            // worker being restarted, the machine being off at 01:00, and two
+            // workers running at once.
+            if (SettingsService::bool('backup.schedule_enabled', false)) {
+                $due = substr((string) SettingsService::get('backup.schedule_time', '01:00'), 0, 5);
+
+                $alreadyToday = (int) Database::instance()->scalar(
+                    "SELECT COUNT(*) FROM backups
+                      WHERE trigger_type = 'scheduled' AND DATE(created_at) = CURDATE()"
+                );
+
+                if ($alreadyToday === 0 && date('H:i') >= $due) {
+                    try {
+                        $backup = BackupService::create('scheduled');
+                        out(sprintf('[%s] scheduled backup written: %s (%s)',
+                            date('H:i:s'), $backup['filename'] ?? '?',
+                            BackupService::humanSize((int) ($backup['size'] ?? 0))), 'green');
+
+                        $keep    = max(1, (int) SettingsService::get('backup.retain_count', 30));
+                        $pruned  = BackupService::pruneOld($keep);
+
+                        if ($pruned > 0) {
+                            out(sprintf('[%s] pruned %d backup(s) beyond the %d most recent',
+                                date('H:i:s'), $pruned, $keep), 'grey');
+                        }
+                    } catch (Throwable $e) {
+                        // Never fatal to the worker: the sessions it closes
+                        // matter more than tonight's backup, and tomorrow's
+                        // tick will try again.
+                        out(sprintf('[%s] scheduled backup FAILED: %s', date('H:i:s'), $e->getMessage()), 'red');
+                        App\Core\Logger::exception($e);
+                    }
+                }
+            }
+
+            // Retention sweeps run hourly rather than every tick.
+            if ($tick % 60 === 1) {
+                $retention = (array) Config::get('attendance.retention', []);
+
+                $purged = [
+                    'heartbeats'   => DeviceService::purgeOldHeartbeats((int) ($retention['heartbeats_days'] ?? 90)),
+                    'notifications' => NotificationService::purgeOld((int) ($retention['notifications_days'] ?? 180)),
+                    'events'       => RealtimeService::purgeOldEvents((int) ($retention['realtime_events_hours'] ?? 48)),
+                    'requests'     => IdempotencyService::purgeOld((int) ($retention['processed_requests_hours'] ?? 24)),
+                    'tickets'      => RealtimeService::purgeExpiredTickets(),
+                    'nonces'       => Database::instance()->execute(
+                        'DELETE FROM device_nonces WHERE used_at < datetime(NOW(), \'-\' || :hours || \' hours\')',
+                        ['hours' => (int) ($retention['nonces_hours'] ?? 24)]
+                    ),
+                ];
+
+                $total = array_sum($purged);
+
+                if ($total > 0) {
+                    out(sprintf('[%s] retention sweep removed %d row(s): %s',
+                        date('H:i:s'), $total,
+                        implode(', ', array_map(
+                            static fn (string $k, int $v): string => $k . '=' . $v,
+                            array_keys($purged), array_values($purged)
+                        ))
+                    ), 'grey');
+                }
+            }
+        } catch (Throwable $e) {
+            out(sprintf('[%s] worker error: %s', date('H:i:s'), $e->getMessage()), 'red');
+            App\Core\Logger::exception($e);
+        }
+
+        if ($once) {
+            break;
+        }
+
+        $elapsed = microtime(true) - $started;
+        $sleep   = max(1, $interval - (int) $elapsed);
+        sleep($sleep);
+    } while (true);
+
+    ok('Worker finished.');
+}
+
+function commandBackup(): void
+{
+    heading('Creating backup');
+
+    $result = BackupService::create('manual', null);
+
+    ok(sprintf('%s — %d tables, %s',
+        $result['filename'], $result['tables'], BackupService::humanSize($result['size'])));
+    out('  SHA-256: ' . $result['checksum'], 'grey');
+    out('  Duration: ' . $result['duration'] . 's', 'grey');
+
+    // The half of a backup that is easy to leave behind.
+    //
+    // The file is encrypted with this installation's APP_KEY, so it can only
+    // be read back by an installation holding that same key. Copy the database
+    // to another PC, run key:generate there, and the backup you carefully took
+    // is permanently unreadable — along with every fingerprint template and
+    // every terminal's HMAC secret, which are encrypted with it too.
+    //
+    // Nothing said so until somebody needed the backup, which is the worst
+    // possible moment to find out.
+    out('');
+    out('  Keep .env with this file.', 'yellow');
+    out('  It is encrypted with this installation\'s APP_KEY and cannot be read', 'grey');
+    out('  back without it — not by this project, not by anyone. The same key', 'grey');
+    out('  also decrypts the fingerprint templates and the terminals\' HMAC', 'grey');
+    out('  secrets, so a database restored beside a NEW key loses all three.', 'grey');
+    out('  Moving to another PC? See docs/MOVING-TO-ANOTHER-PC.md', 'grey');
+}
+
+/**
+ * Diagnose a running installation.
+ *
+ * Written for the situation where a page "does not work" and nobody can see
+ * why: it reports what the system actually contains and which of its moving
+ * parts are running, rather than asking anyone to read a log. Every check is
+ * read-only, so it is safe to run against a live school installation.
+ */
+function commandDoctor(): void
+{
+    $problems = [];
+    $warnings = [];
+
+    $note = static function (string $message): void { out('    ' . $message, 'grey'); };
+
+    $check = static function (bool $healthy, string $label, string $detail = '') use (&$problems): void {
+        out(sprintf('  %s %-42s %s', $healthy ? '✓' : '✗', $label, $detail), $healthy ? 'green' : 'red');
+
+        if (!$healthy) {
+            $problems[] = $label . ($detail === '' ? '' : ' — ' . $detail);
+        }
+    };
+
+    $warn = static function (string $label, string $detail = '') use (&$warnings): void {
+        out(sprintf('  ! %-42s %s', $label, $detail), 'yellow');
+        $warnings[] = $label . ($detail === '' ? '' : ' — ' . $detail);
+    };
+
+    // ------------------------------------------------------------ runtime --
+    heading('Runtime');
+
+    $check(PHP_VERSION_ID >= 80100, 'PHP 8.1 or newer', PHP_VERSION);
+
+    foreach (['pdo_sqlite', 'openssl', 'mbstring', 'json'] as $extension) {
+        $check(extension_loaded($extension), 'Extension ' . $extension, extension_loaded($extension) ? '' : 'not loaded');
+    }
+
+    // Named with the fix rather than only the consequence.
+    //
+    // ext-zip used to be listed here, because Excel export, Excel import and
+    // the device provisioning bundle all failed without it. They no longer
+    // depend on it: App\Services\Export\Zip writes and reads the container in
+    // plain PHP. An optional-extension warning is the right place to catch a
+    // php.ini line, but the better answer was not to need the line at all.
+    $optional = [
+        'gd' => ['profile photo uploads', 'remove the semicolon from ";extension=gd" in php.ini, then restart Apache'],
+    ];
+
+    foreach ($optional as $extension => [$used, $fix]) {
+        if (!extension_loaded($extension)) {
+            $warn('Extension ' . $extension . ' off', $used . ' — ' . $fix);
+        }
+    }
+
+    // ------------------------------------------------------ configuration --
+    heading('Configuration');
+
+    $check(is_file(BASE_PATH . '/.env'), '.env exists');
+
+    foreach (['APP_KEY', 'API_KEY_PEPPER', 'REALTIME_TICKET_SECRET'] as $key) {
+        $value = (string) Env::get($key, '');
+        $check($value !== '', $key, $value === '' ? 'not set — run key:generate' : 'set');
+    }
+
+    $appUrl = (string) Env::get('APP_URL', '');
+    if ($appUrl === '') {
+        $note('APP_URL is blank; the base URL is derived from the request host. That is fine on a LAN.');
+    } else {
+        $note('APP_URL is ' . $appUrl);
+    }
+
+    // -------------------------------------------------- transport security --
+    heading('Transport security');
+
+    doctorTls($appUrl, $check, $warn, $note);
+
+    // --------------------------------------------------------------- data --
+    heading('Database');
+
+    $databasePath = (string) Config::get('database.path', '');
+
+    // Asked before opening it, because opening a SQLite file that is not there
+    // creates an empty one — and an empty database with no tables reads as a
+    // dozen unrelated failures further down instead of the one real problem.
+    if (!is_file($databasePath)) {
+        $check(false, 'Database file', 'not found at ' . $databasePath);
+        $note('A new installation: run install.bat (or "php bin/console install").');
+        $note('Moving from the MariaDB version: run "php bin/console db:import-mysql".');
+        $note('Restoring after a move: copy storage\\database\\lsiams.sqlite from the old PC.');
+        doctorSummary($problems, $warnings);
+
+        return;
+    }
+
+    try {
+        $db = Database::instance();
+        $db->scalar('SELECT 1');
+        ok(sprintf('Opened %s (%s, SQLite %s)', $databasePath,
+            App\Services\BackupService::humanSize((int) filesize($databasePath)),
+            (string) $db->scalar('SELECT sqlite_version()')));
+    } catch (Throwable $e) {
+        $check(false, 'Database file opens', ($e->getPrevious() ?? $e)->getMessage());
+        doctorSummary($problems, $warnings);
+
+        return;
+    }
+
+    // Generated columns, which the schema relies on, arrived in SQLite 3.31.
+    $sqliteVersion = (string) $db->scalar('SELECT sqlite_version()');
+    $check(version_compare($sqliteVersion, '3.31.0', '>='), 'SQLite 3.31 or newer', $sqliteVersion);
+
+    $writable = is_writable($databasePath) && is_writable(dirname($databasePath));
+    $check($writable, 'Database file and folder writable',
+        $writable ? '' : 'SQLite writes its -wal and -shm files beside the database');
+
+    $journal = strtolower((string) $db->scalar('PRAGMA journal_mode'));
+    $check($journal === 'wal', 'Journal mode WAL', $journal === 'wal' ? '' : 'is ' . $journal . ' — readers will wait for every tap');
+    $check((int) $db->scalar('PRAGMA foreign_keys') === 1, 'Foreign keys enforced');
+
+    // quick_check reads every page without the slower index cross-checks;
+    // it is what notices a file damaged by a power cut or a bad copy.
+    $quick = (string) $db->scalar('PRAGMA quick_check');
+    $check($quick === 'ok', 'File integrity', $quick === 'ok' ? '' : $quick);
+
+    $orphans = $db->foreignKeyViolations();
+
+    if ($orphans !== []) {
+        $warn('Rows whose parent row is missing', implode(', ', array_map(
+            static fn (string $k, int $n): string => "$n in $k", array_keys($orphans), $orphans
+        )));
+    }
+
+    ensureMigrationsTable($db);
+
+    $applied = array_column($db->select('SELECT migration FROM schema_migrations'), 'migration');
+    $pending = array_values(array_filter(
+        array_column(discoverMigrations(), 'name'),
+        static fn (string $name): bool => !in_array($name, $applied, true)
+    ));
+
+    $check($pending === [], 'All migrations applied', $pending === [] ? count($applied) . ' applied' : implode(', ', $pending));
+
+    $counts = [
+        'departments'  => "SELECT COUNT(*) FROM departments WHERE deleted_at IS NULL",
+        'teachers'     => "SELECT COUNT(*) FROM teachers WHERE deleted_at IS NULL AND status = 'active'",
+        'students'     => "SELECT COUNT(*) FROM students WHERE deleted_at IS NULL AND status = 'active'",
+        'sections'     => "SELECT COUNT(*) FROM sections WHERE deleted_at IS NULL",
+        'schedules'    => "SELECT COUNT(*) FROM schedules WHERE deleted_at IS NULL AND status = 'active'",
+        'devices'      => "SELECT COUNT(*) FROM devices WHERE deleted_at IS NULL",
+        'user accounts' => "SELECT COUNT(*) FROM users WHERE deleted_at IS NULL",
+    ];
+
+    heading('What this system contains');
+
+    foreach ($counts as $label => $sql) {
+        out(sprintf('  %-16s %d', $label, (int) $db->scalar($sql)), 'grey');
+    }
+
+    // -------------------------------------------------------- fingerprints --
+    // ---------------------------------------------------- key vs the data --
+    //
+    // Does APP_KEY still open what APP_KEY encrypted?
+    //
+    // A database and an .env travel separately, and the commonest way they get
+    // separated is moving to another PC: copy the data, run key:generate on
+    // the new machine, and every encrypted value in the database becomes
+    // unreadable at once. Nothing announced it. The terminals simply stopped
+    // authenticating and the fingerprints simply stopped matching, each of
+    // which looks like its own hardware fault, and neither of which is.
+    //
+    // One decryption of each kind settles it in milliseconds.
+    heading('Encryption key');
+
+    // Every ACTIVE key, not one arbitrary row.
+    //
+    // The first version of this took a single sample with `LIMIT 1` and no
+    // status filter, and rotating a key is exactly what makes that wrong.
+    // Rotation leaves the superseded row behind with status 'rotating' and
+    // revoked_at still NULL, so the sample could land on a key that has been
+    // replaced — unreadable by design after an APP_KEY change, and no longer
+    // used by anything. It then reported a failure that had already been
+    // fixed, which is worse than reporting nothing: it sends somebody back to
+    // repair what they just repaired.
+    //
+    // The useful question is not "is some row readable" but "can every key a
+    // terminal might present still be read", and, when the answer is no,
+    // which terminals. Superseded and revoked rows are ignored throughout;
+    // they are history, and history being unreadable costs nothing.
+    $activeKeys = $db->select(
+        "SELECT k.api_key_id, k.hmac_secret_encrypted, d.device_id
+           FROM api_keys k
+      LEFT JOIN devices d ON d.id = k.device_row_id
+          WHERE k.status = 'active'
+            AND k.revoked_at IS NULL
+            AND k.hmac_secret_encrypted IS NOT NULL"
+    );
+
+    $unreadableDevices = [];
+
+    foreach ($activeKeys as $row) {
+        try {
+            Crypto::decrypt((string) $row['hmac_secret_encrypted']);
+        } catch (Throwable $e) {
+            $unreadableDevices[] = (string) ($row['device_id'] ?? ('key #' . $row['api_key_id']));
+        }
+    }
+
+    $templatesTotal      = 0;
+    $templatesUnreadable = 0;
+
+    if ($db->hasColumn('fingerprint_templates', 'template_data')) {
+        foreach ($db->select('SELECT template_data FROM fingerprint_templates
+                               WHERE template_data IS NOT NULL') as $row) {
+            $templatesTotal++;
+
+            try {
+                Crypto::decrypt((string) $row['template_data']);
+            } catch (Throwable $e) {
+                $templatesUnreadable++;
+            }
+        }
+    }
+
+    if ($activeKeys === []) {
+        out(sprintf('  %-44s %s', 'terminal keys', 'none issued yet'), 'grey');
+    } else {
+        $check(
+            $unreadableDevices === [],
+            'APP_KEY decrypts every terminal key',
+            $unreadableDevices === []
+                ? count($activeKeys) . ' of ' . count($activeKeys) . ' readable'
+                : count($unreadableDevices) . ' of ' . count($activeKeys) . ' UNREADABLE'
+        );
+    }
+
+    if ($templatesTotal === 0) {
+        out(sprintf('  %-44s %s', 'fingerprint templates', 'none stored yet'), 'grey');
+    } else {
+        $check(
+            $templatesUnreadable === 0,
+            'APP_KEY decrypts every fingerprint template',
+            $templatesUnreadable === 0
+                ? $templatesTotal . ' of ' . $templatesTotal . ' readable'
+                : $templatesUnreadable . ' of ' . $templatesTotal . ' UNREADABLE'
+        );
+    }
+
+    if ($unreadableDevices !== [] || $templatesUnreadable > 0) {
+        $note('APP_KEY in .env is not the key this data was encrypted with — the usual');
+        $note('cause is a database copied to another PC where new keys were generated.');
+        $note('');
+
+        if ($unreadableDevices !== []) {
+            $note('Terminals that cannot authenticate: ' . implode(', ', $unreadableDevices));
+            $note('Each is repaired by regenerating its provisioning file from Admin → IoT');
+            $note('Devices, which issues a key under the CURRENT APP_KEY. That also resets');
+            $note('the device to unclaimed, so paste the new claim token in as well.');
+        }
+
+        if ($templatesUnreadable > 0) {
+            $note($templatesUnreadable . ' fingerprint template(s) cannot be recovered this way and');
+            $note('must be enrolled again.');
+        }
+
+        $note('');
+        $note('Restoring the ORIGINAL .env fixes all of it at once and loses nothing.');
+        $note('See docs/MOVING-TO-ANOTHER-PC.md');
+    } elseif ($activeKeys === [] && $templatesTotal === 0) {
+        $note('Nothing encrypted is stored yet, so there is nothing to verify. This is');
+        $note('normal on a fresh installation.');
+    }
+
+    heading('Fingerprints');
+
+    $teachers = (int) $db->scalar("SELECT COUNT(*) FROM teachers WHERE deleted_at IS NULL AND status = 'active'");
+    $enrolled = (int) $db->scalar(
+        'SELECT COUNT(*) FROM fingerprint_templates fp
+           JOIN teachers t ON t.teacher_id = fp.teacher_id
+          WHERE t.deleted_at IS NULL'
+    );
+
+    if ($teachers === 0) {
+        $warn('No teacher records', 'nothing can be enrolled; add one under Teachers');
+        $note('A user account with the teacher role is not a teacher record. Schedules,');
+        $note('sections and fingerprints all attach to the teacher record, not the account.');
+    } else {
+        out(sprintf('  %-16s %d of %d active teachers', 'enrolled', $enrolled, $teachers), 'grey');
+    }
+
+    // The page lists "awaiting enrolment" from the template table and the
+    // teacher's own status column. When those two disagree a teacher can be
+    // shown twice, or vanish from both lists — worth naming explicitly.
+    $drift = $db->select(
+        "SELECT t.teacher_id, t.employee_number, t.last_name, t.fingerprint_status,
+                (fp.fingerprint_id IS NOT NULL) AS has_template
+           FROM teachers t
+      LEFT JOIN fingerprint_templates fp ON fp.teacher_id = t.teacher_id
+          WHERE t.deleted_at IS NULL
+            AND ((t.fingerprint_status = 'enrolled' AND fp.fingerprint_id IS NULL)
+              OR (t.fingerprint_status = 'not_enrolled' AND fp.fingerprint_id IS NOT NULL))"
+    );
+
+    if ($drift === []) {
+        ok('Teacher status and template records agree');
+    } else {
+        foreach ($drift as $row) {
+            $warn(
+                'Inconsistent: ' . $row['last_name'] . ' (' . $row['employee_number'] . ')',
+                'status says ' . $row['fingerprint_status'] . ', template '
+                    . ($row['has_template'] ? 'exists' : 'missing')
+            );
+        }
+
+        $note('Re-enrol or delete the enrolment on the Fingerprints page to resolve.');
+    }
+
+    // ------------------------------------------------------------ devices --
+    heading('Terminals');
+
+    // Module health is only selected where migration 019 has run, so doctor
+    // still works on a database that is behind the code — which is exactly
+    // the situation somebody runs doctor to diagnose.
+    $hasModuleHealth = $db->hasColumn('devices', 'rfid_ok');
+
+    $devices = $db->select(
+        'SELECT device_id, mac_address, status, claim_status, last_heartbeat_at, classroom_id'
+        . ($hasModuleHealth ? ', rfid_ok, fingerprint_ok' : ', NULL AS rfid_ok, NULL AS fingerprint_ok')
+        . ' FROM devices WHERE deleted_at IS NULL ORDER BY device_id'
+    );
+
+    if ($devices === []) {
+        $warn('No terminals registered', 'add one under Devices before flashing an ESP32');
+    }
+
+    $heartbeatWindow = (int) Config::get('attendance.device.offline_after_sec', 90);
+
+    foreach ($devices as $device) {
+        $seen = $device['last_heartbeat_at'] === null
+            ? 'never seen'
+            : 'last seen ' . $device['last_heartbeat_at'];
+
+        $stale = $device['last_heartbeat_at'] !== null
+            && (Clock::timestamp() - strtotime((string) $device['last_heartbeat_at'])) > $heartbeatWindow;
+
+        $detail = $device['status'] . ', ' . $device['claim_status'] . ', ' . $seen;
+
+        if ($device['claim_status'] !== 'claimed') {
+            $warn((string) $device['device_id'], $detail . ' — the board has not claimed its API key yet');
+
+            // Both halves of what the claim checks, printed together, because
+            // CLAIM_IDENTITY_MISMATCH does not say which of the two is wrong
+            // and the answer is always "compare these against the board".
+            $note('registered MAC: ' . $device['mac_address'] . ' — this must match the address the');
+            $note('sketch prints at boot, exactly, or the claim is refused.');
+        } elseif ($device['classroom_id'] === null) {
+            $warn((string) $device['device_id'], $detail . ' — no classroom assigned, so no schedule can match');
+        } elseif ($device['last_heartbeat_at'] === null || $stale) {
+            $warn((string) $device['device_id'], $detail . ' — not currently reporting');
+        } elseif ($device['rfid_ok'] !== null
+               && ((int) $device['rfid_ok'] === 0 || (int) $device['fingerprint_ok'] === 0)) {
+            // Reporting on schedule and still unable to do its job. This is
+            // the state that used to be invisible from every page: online by
+            // every measure the server had, while reading nothing at all.
+            $dead = (int) $device['rfid_ok'] === 0 && (int) $device['fingerprint_ok'] === 0
+                ? 'neither module answered at boot'
+                : ((int) $device['rfid_ok'] === 0
+                    ? 'the card reader did not answer at boot'
+                    : 'the fingerprint sensor did not answer at boot');
+
+            $warn((string) $device['device_id'], $detail . ' — online, but ' . $dead);
+            $note('It is connected and reporting, so this is wiring or power at the terminal,');
+            $note('not the network. Its Serial Monitor prints the fault on every boot.');
+        } else {
+            ok(sprintf('%-20s %s', $device['device_id'], $detail));
+        }
+    }
+
+    // ----------------------------------------------------------- realtime --
+    // -------------------------------------------------------- the website --
+    //
+    // The check that was missing, and the one everything else depends on.
+    //
+    // doctor probed the realtime server but never the site itself, so an
+    // installation whose web server simply was not running passed every check
+    // and reported nothing wrong. The terminals then failed with "could not
+    // connect", which reads as a network fault and sends the search to the
+    // Wi-Fi, the IP address and the router.
+    //
+    // XAMPP makes it easy to believe the site is up when it is not. Its
+    // control panel shows Apache running in green on ports 80 and 443 — and
+    // Apache does not serve this system. start.bat does, on 8080, in its own
+    // window. Two green rows in XAMPP and a stopped site look identical from
+    // the outside.
+    heading('The website');
+
+    // Declared out here rather than inside the reachability branch below,
+    // because the realtime check further down uses it too — and a website
+    // check that fails must not leave it undefined and take the whole doctor
+    // down with it. Null means "not determined", which every reader handles.
+    $lanIp    = null;
+    $lanGuess = false;
+
+    $webPort = 8080;
+    $appUrl  = (string) Env::get('APP_URL', '');
+    $isHttps = str_starts_with(strtolower($appUrl), 'https://');
+    $scheme  = $isHttps ? 'https://' : 'http://';
+
+    if ($appUrl !== '') {
+        $parsedPort = parse_url($appUrl, PHP_URL_PORT);
+        if (is_int($parsedPort)) {
+            $webPort = $parsedPort;
+        } elseif (str_starts_with($appUrl, 'https://')) {
+            $webPort = 443;
+        } elseif (str_starts_with($appUrl, 'http://')) {
+            $webPort = 80;
+        }
+    }
+
+    $site = @fsockopen('127.0.0.1', $webPort, $siteErrno, $siteErrstr, 1.5);
+
+    if (is_resource($site)) {
+        fclose($site);
+        $check(true, 'Website is listening on port ' . $webPort);
+
+        // Reaching it from this PC proves nothing about reaching it from a
+        // classroom. A terminal connects to the LAN address, and a server
+        // bound only to loopback, or a firewall rule that never got its
+        // "allow", answers on 127.0.0.1 and refuses everything else.
+        //
+        // That failure is invisible from the browser on the same machine,
+        // which is where anyone naturally checks, and it presents at the
+        // terminal as "could not connect" — indistinguishable from a stopped
+        // server. Probing the machine's own LAN address separates the two.
+        // The certificate first, when there is one, because it is the only
+        // address here that somebody actually chose. Everything below it is
+        // this machine guessing from its network adapters, and a Windows PC
+        // running VMware, VirtualBox, Hyper-V or WSL has several — each with a
+        // private address that looks exactly as plausible as the real one.
+        //
+        // Guessing wrong is not a cosmetic problem. This is the address the
+        // note below tells somebody to compile into every terminal, and a
+        // virtual adapter's address is both unreachable from a classroom and
+        // absent from the certificate, so the boards would fail twice over.
+        $appHost = (string) (parse_url($appUrl, PHP_URL_HOST) ?: '');
+
+        if (filter_var($appHost, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && !str_starts_with($appHost, '127.')) {
+            $lanIp = $appHost;
+        }
+
+        if ($lanIp === null && TlsCertificateService::serverCertificateExists()) {
+            foreach (TlsCertificateService::subjectAltNames() as $name) {
+                if (filter_var($name, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && !str_starts_with($name, '127.')) {
+                    $lanIp = $name;
+                    break;
+                }
+            }
+        }
+
+        if ($lanIp === null) {
+            $viaHostname = @gethostbyname(@gethostname() ?: '');
+
+            if (is_string($viaHostname)
+                && filter_var($viaHostname, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                && !str_starts_with($viaHostname, '127.')
+            ) {
+                $lanIp    = $viaHostname;
+                $lanGuess = true;
+            }
+        }
+
+        if ($lanIp === null) {
+            // No packets leave: connecting a UDP socket only fixes the local
+            // end, and the address it picks is the one this machine would
+            // send from. Needs a route to exist, nothing more.
+            $probe = @stream_socket_client('udp://192.0.2.1:53', $e1, $e2, 0.5);
+
+            if (is_resource($probe)) {
+                $local = (string) @stream_socket_get_name($probe, false);
+                fclose($probe);
+
+                $candidate = substr($local, 0, (int) strrpos($local, ':') ?: 0);
+
+                if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                    && !str_starts_with($candidate, '127.')
+                ) {
+                    $lanIp    = $candidate;
+                    $lanGuess = true;
+                }
+            }
+        }
+
+        if ($lanIp === null) {
+            $note('This PC\'s LAN address could not be determined here, so whether a');
+            $note('terminal can reach the site was not tested. Run ipconfig and open');
+            $note($scheme . '<that address>:' . $webPort . ' in a browser to check by hand.');
+        } else {
+            $lanSocket = @fsockopen($lanIp, $webPort, $lanErrno, $lanErrstr, 1.5);
+
+            if (is_resource($lanSocket)) {
+                fclose($lanSocket);
+                $check(true, 'Reachable from the network on ' . $lanIp . ':' . $webPort);
+
+                // Only offer it as the terminals' address if the certificate
+                // agrees. A guessed adapter address that answers here is still
+                // the wrong thing to compile into a board.
+                $onCertificate = !TlsCertificateService::serverCertificateExists()
+                    || TlsCertificateService::covers($scheme . $lanIp)['covered'];
+
+                if ($onCertificate && !$lanGuess) {
+                    $note('That is the address the terminals must have in LS_SERVER_URL,');
+                    $note('written in full: ' . $scheme . $lanIp . ($webPort === 443 || $webPort === 80 ? '' : ':' . $webPort));
+                } elseif (!$onCertificate) {
+                    $warn('Detected address is not on the certificate', $lanIp);
+                    $note('This machine has more than one network adapter and this is probably');
+                    $note('not the real one — VMware, VirtualBox, Hyper-V and WSL each add a');
+                    $note('private address that looks just as plausible as the LAN address.');
+                    $note('');
+                    $note('Do NOT put this address in LS_SERVER_URL. A terminal would be unable');
+                    $note('to reach it from a classroom, and would reject the certificate even');
+                    $note('if it could. Use the address the certificate names:');
+
+                    foreach (TlsCertificateService::subjectAltNames() as $name) {
+                        if ($name !== '127.0.0.1' && $name !== 'localhost') {
+                            $note('  ' . $scheme . $name . ($webPort === 443 || $webPort === 80 ? '' : ':' . $webPort));
+                        }
+                    }
+                } else {
+                    $note('That address was guessed from this PC\'s adapters. Confirm it against');
+                    $note('ipconfig before putting it in LS_SERVER_URL:');
+                    $note('  ' . $scheme . $lanIp . ($webPort === 443 || $webPort === 80 ? '' : ':' . $webPort));
+                }
+            } else {
+                $check(false, 'Reachable from the network on ' . $lanIp . ':' . $webPort,
+                    $lanErrstr ?: 'refused');
+
+                $note('The site answers on this PC but not on its own network address, so no');
+                $note('terminal can reach it while the browser here works perfectly — which');
+                $note('is why this looks like a fault at the board.');
+                $note('');
+                $binary = $isHttps ? 'httpd.exe' : 'php.exe';
+
+                $note('Windows Firewall is the usual cause: it asks once whether to allow');
+                $note($binary . ', and a "Cancel" or a "Public networks only" answer produces');
+                $note('exactly this. Allow ' . $binary . ' on Private networks.');
+                $note('');
+
+                if ($isHttps) {
+                    $note('The other cause is a Listen line bound to one address. The config');
+                    $note('written by tls:apache uses a bare "Listen ' . $webPort . '", which accepts');
+                    $note('every address, so this points at the firewall unless that line was');
+                    $note('edited.');
+                } else {
+                    $note('The other cause is a server bound to localhost. start.bat binds');
+                    $note('0.0.0.0 deliberately, so this points at the firewall unless the site');
+                    $note('is being started some other way.');
+                }
+            }
+        }
+    } else {
+        $check(false, 'Website is listening on port ' . $webPort,
+            $siteErrstr ?: 'nothing is listening');
+
+        $note('Nothing is serving the system right now, so no browser and no terminal');
+        $note('can reach it.');
+        $note('');
+
+        // Which advice is right depends entirely on who is meant to be serving
+        // the site, and that flipped when HTTPS was switched on. Telling an
+        // Apache installation to run start.bat — or telling a start.bat
+        // installation to look at Apache — sends someone to check the one thing
+        // that is working and ignore the one that is not.
+        if ($isHttps) {
+            $note('This installation serves over HTTPS, which means Apache serves it:');
+            $note('  1. Open the XAMPP Control Panel and Start Apache.');
+            $note('  2. If Apache will not stay started, open its Logs -> Apache');
+            $note('     (error.log) button. Port ' . $webPort . ' already in use is the usual');
+            $note('     cause, normally XAMPP\'s own httpd-ssl.conf still being included.');
+            $note('  3. If Apache is running but nothing answers here, it is probably not');
+            $note('     including the L-SIAMS config. Run console.bat tls:apache again and');
+            $note('     re-check the Include line at the bottom of httpd.conf.');
+            $note('');
+            $note('start.bat does NOT serve the site any more — PHP\'s built-in server');
+            $note('cannot do HTTPS. It still starts the worker and the realtime server,');
+            $note('and both are still needed.');
+        } else {
+            $note('Run start.bat — it serves the site on port ' . $webPort . ' and must stay');
+            $note('open while the system is in use.');
+            $note('');
+            $note('XAMPP\'s Apache does NOT serve L-SIAMS, so Apache showing green on ports');
+            $note('80 and 443 in the XAMPP Control Panel does not mean the site is up.');
+            $note('Nothing needs starting in XAMPP; start.bat provides the web server itself.');
+        }
+    }
+
+    heading('Live updates');
+
+    $realtimeEnabled = (bool) Config::get('realtime.enabled', true);
+    $sseEnabled      = (bool) Config::get('realtime.fallback.sse_enabled', true);
+    $wsHost          = (string) Config::get('realtime.ws_host', '127.0.0.1');
+    $wsPort          = (int) Config::get('realtime.ws_port', 8443);
+
+    if (!$realtimeEnabled) {
+        $note('Realtime is switched off; every page falls back to short polling.');
+    } else {
+        // 0.0.0.0 is a bind address, not something to connect to.
+        $probeHost = in_array($wsHost, ['0.0.0.0', '::'], true) ? '127.0.0.1' : $wsHost;
+        $socket    = @fsockopen($probeHost, $wsPort, $errno, $errstr, 1.5);
+
+        if (is_resource($socket)) {
+            fclose($socket);
+            ok('Realtime server is listening on ' . $probeHost . ':' . $wsPort);
+
+            // Loopback is not the address any browser will use. The page is
+            // handed wss://<the host it was opened as>:<port>, so a rule that
+            // blocks the port on the network interface leaves this check green
+            // and every dashboard on "Polling" — including the one on this very
+            // machine, because it reaches the site by its LAN address too.
+            //
+            // Loopback also bypasses Windows Firewall outright, which is what
+            // makes the difference invisible from here: the probe above cannot
+            // fail for the one reason most likely to be true.
+            // The website section works this out already, but it only gets
+            // that far when the site itself answers. The realtime port is worth
+            // testing either way, so fall back to the address people type.
+            if ($lanIp === null) {
+                $fromAppUrl = (string) (parse_url((string) Env::get('APP_URL', ''), PHP_URL_HOST) ?: '');
+
+                if (filter_var($fromAppUrl, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                    && !str_starts_with($fromAppUrl, '127.')) {
+                    $lanIp = $fromAppUrl;
+                }
+            }
+
+            if ($lanIp !== null && $lanIp !== $probeHost) {
+                $lanWs = @fsockopen($lanIp, $wsPort, $wsErrno, $wsErrstr, 1.5);
+
+                if (is_resource($lanWs)) {
+                    fclose($lanWs);
+                    $check(true, 'Reachable for browsers on ' . $lanIp . ':' . $wsPort);
+
+                    // Answering is not the same as answering with a certificate
+                    // a browser will accept, and the gap between them is the
+                    // whole difference between "Live" and "Polling".
+                    //
+                    // The realtime server decides between tls:// and tcp:// once,
+                    // when it binds, from REALTIME_TLS_ENABLED and whether the
+                    // certificate files were readable at that moment. Turn TLS
+                    // on, or issue the certificate, while it is already running
+                    // and it carries on listening in plaintext for the rest of
+                    // its life — with .env correct, the files on disk correct,
+                    // the port open, and every dashboard refusing to connect
+                    // because the page is asking for wss:// and getting ws://.
+                    //
+                    // (The certificate's contents are re-read per connection, so
+                    // reissuing one does not need a restart. Only the scheme is
+                    // fixed at startup.)
+                    if ((bool) Config::get('realtime.tls.enabled', true)
+                        && TlsCertificateService::serverCertificateExists()) {
+                        $wsContext = stream_context_create([
+                            'ssl' => [
+                                'cafile'            => TlsCertificateService::paths()['ca_cert'],
+                                'verify_peer'       => true,
+                                'verify_peer_name'  => true,
+                                'peer_name'         => $lanIp,
+                                'allow_self_signed' => false,
+                            ],
+                        ]);
+
+                        $wsTlsErrno = 0;
+                        $wsTlsError = '';
+                        $wsTls      = @stream_socket_client(
+                            sprintf('ssl://%s:%d', $lanIp, $wsPort),
+                            $wsTlsErrno,
+                            $wsTlsError,
+                            5,
+                            STREAM_CLIENT_CONNECT,
+                            $wsContext
+                        );
+
+                        if (is_resource($wsTls)) {
+                            fclose($wsTls);
+                            $check(true, 'Realtime certificate validates', 'browsers will accept wss://');
+                        } else {
+                            $check(false, 'Realtime certificate validates',
+                                trim($wsTlsError) !== '' ? trim($wsTlsError) : 'handshake refused');
+
+                            $note('The port is open but the certificate it presents does not validate,');
+                            $note('so browsers refuse the WebSocket and every dashboard stays on');
+                            $note('"Polling" — silently, because a WebSocket has no warning to show.');
+                            $note('');
+                            $note('Almost always this is a realtime server that started before TLS');
+                            $note('was switched on, or before the certificate existed. It chooses');
+                            $note('between encrypted and plaintext once, when it binds, and keeps');
+                            $note('that choice — so it is still listening in plaintext while every');
+                            $note('page asks it for wss://.');
+                            $note('');
+                            $note('Run stop.bat then start.bat. Nothing else needs changing.');
+                        }
+                    }
+                } else {
+                    $check(false, 'Reachable for browsers on ' . $lanIp . ':' . $wsPort,
+                        $wsErrstr ?: 'refused');
+
+                    $note('The realtime server answers on loopback but not on the address the');
+                    $note('page actually connects to, so every dashboard falls back to polling');
+                    $note('while this section otherwise looks healthy.');
+                    $note('');
+                    $note('Windows Firewall is the usual cause. It asks once per program, and');
+                    $note('the realtime server is a second php.exe — a rule granted for the web');
+                    $note('server does not cover it. Allow php.exe on Private networks, or add');
+                    $note('an inbound rule for TCP ' . $wsPort . '.');
+                }
+            }
+
+            // Reachable from here says nothing about whether a browser will
+            // accept it, and the difference is invisible from this side.
+            //
+            // A browser shows a click-through warning for an https page it does
+            // not trust. It shows nothing at all for a WebSocket: an untrusted
+            // certificate fails the handshake silently, with no interstitial
+            // and no way to accept it. The exception someone clicked for the
+            // site does not carry over either, because the realtime server is
+            // on its own port and exceptions are per port.
+            //
+            // So on a private root the dashboards sit on "Polling" until the
+            // root is installed — the page working perfectly is what makes this
+            // one hard to place.
+            if ((bool) Config::get('realtime.tls.enabled', true)
+                && TlsCertificateService::serverCertificateExists()) {
+                $note('Dashboards will still read "Polling" on any PC that has not installed');
+                $note('the school root, even where the site itself opens. A browser gives no');
+                $note('click-through for a WebSocket — an untrusted certificate just fails.');
+                $note('Install storage/tls/ca.crt on that PC and the pill turns "Live".');
+            }
+        } else {
+            $warn(
+                'Realtime server not reachable',
+                $probeHost . ':' . $wsPort . ' — ' . ($errstr ?: 'connection refused')
+            );
+            $note('The pill in the top bar will read "Polling" instead of "Live". Every page');
+            $note('still works; updates arrive on a few-second refresh rather than instantly.');
+            $note('start.bat opens it in its own window — check that window is still open.');
+        }
+    }
+
+    $note('Server-Sent Events are ' . ($sseEnabled ? 'on' : 'off (correct for start.bat)') . '.');
+
+    // ------------------------------------------------------------ storage --
+    heading('Storage');
+
+    foreach (['storage/logs', 'storage/reports', 'storage/backups', 'public/uploads'] as $relative) {
+        $path = BASE_PATH . '/' . $relative;
+
+        if (!is_dir($path)) {
+            $warn($relative, 'missing — it is created on first use');
+            continue;
+        }
+
+        $check(is_writable($path), $relative . ' writable');
+    }
+
+    doctorSummary($problems, $warnings);
+}
+
+/**
+ * @param list<string> $problems
+ * @param list<string> $warnings
+ */
+function doctorSummary(array $problems, array $warnings): void
+{
+    heading('Summary');
+
+    if ($problems === [] && $warnings === []) {
+        out('  Nothing to report. Everything checked is healthy.', 'green');
+        out('');
+
+        return;
+    }
+
+    if ($problems !== []) {
+        out('  ' . count($problems) . ' problem(s) that will stop something from working:', 'red');
+
+        foreach ($problems as $problem) {
+            out('    - ' . $problem, 'red');
+        }
+    }
+
+    if ($warnings !== []) {
+        out('  ' . count($warnings) . ' thing(s) worth knowing about:', 'yellow');
+
+        foreach ($warnings as $warning) {
+            out('    - ' . $warning, 'yellow');
+        }
+    }
+
+    out('');
+}
+
+/**
+ * Static assurance for the Part 20.4 acceptance criterion:
+ * "rand(), mt_rand(), and uniqid() appear nowhere in the key path".
+ */
+/**
+ * Prove that the database refuses to rewrite history.
+ *
+ * The audit trail is protected by the services, which expose no update or
+ * delete method, and by triggers in the database itself, which refuse the
+ * statement whoever sends it. SQLite has no user accounts or grants, so the
+ * triggers are the layer that holds against a direct SQL session; the one
+ * beyond them is who may open the file at all (docs/DEPLOYMENT.md).
+ *
+ * A trigger can quietly stop being there — a restore from an old copy, a hand
+ * edit — so it is checked rather than assumed, and checked by doing: each
+ * forbidden statement is actually attempted on a real row, inside a
+ * transaction that is always rolled back. A guard that holds refuses it; a
+ * guard that is missing lets it through, and the rollback undoes it. Either
+ * way nothing is changed, which is what makes this safe to run on a live
+ * system.
+ */
+function commandAuditPrivileges(): void
+{
+    $db = Database::instance();
+
+    heading('History protection');
+
+    $attempts = [
+        ['attendance_records', 'DELETE', 'DELETE FROM attendance_records WHERE rowid = :id'],
+        ['audit_logs',         'DELETE', 'DELETE FROM audit_logs WHERE rowid = :id'],
+        ['audit_logs',         'UPDATE', "UPDATE audit_logs SET description = 'x' WHERE rowid = :id"],
+        ['security_logs',      'DELETE', 'DELETE FROM security_logs WHERE rowid = :id'],
+        ['security_logs',      'UPDATE', "UPDATE security_logs SET description = 'x' WHERE rowid = :id"],
+        ['login_history',      'DELETE', 'DELETE FROM login_history WHERE rowid = :id'],
+    ];
+
+    $failures = 0;
+
+    foreach ($attempts as [$table, $verb, $sql]) {
+        $rowId = $db->scalar(sprintf('SELECT rowid FROM %s ORDER BY rowid LIMIT 1', $table));
+
+        if ($rowId === null) {
+            out(sprintf('  - %-20s %-6s no rows yet to try it on', $table, $verb), 'grey');
+            continue;
+        }
+
+        $refused = false;
+        $db->beginTransaction();
+
+        try {
+            $db->execute($sql, ['id' => (int) $rowId]);
+        } catch (PDOException) {
+            $refused = true;
+        } finally {
+            $db->rollBack();
+        }
+
+        if ($refused) {
+            out(sprintf('  ✓ %-20s %-6s refused', $table, $verb), 'green');
+        } else {
+            out(sprintf('  ✗ %-20s %-6s was ALLOWED (rolled back, nothing changed)', $table, $verb), 'red');
+            $failures++;
+        }
+    }
+
+    // security_logs is meant to be updatable in its triage columns only.
+    $rowId = $db->scalar('SELECT rowid FROM security_logs ORDER BY rowid LIMIT 1');
+
+    if ($rowId !== null) {
+        $db->beginTransaction();
+
+        try {
+            $db->execute("UPDATE security_logs SET admin_notes = admin_notes WHERE rowid = :id", ['id' => (int) $rowId]);
+            out(sprintf('  ✓ %-20s %-6s triage notes still editable', 'security_logs', 'UPDATE'), 'green');
+        } catch (PDOException $e) {
+            out(sprintf('  ✗ %-20s %-6s triage notes refused: %s', 'security_logs', 'UPDATE', $e->getMessage()), 'red');
+            $failures++;
+        } finally {
+            $db->rollBack();
+        }
+    }
+
+    out('');
+
+    if ($failures === 0) {
+        ok('Every guard holds. History cannot be deleted or rewritten through SQL.');
+        out('  The file itself is the remaining boundary: keep storage\\database readable', 'grey');
+        out('  only by the account that runs L-SIAMS (docs/DEPLOYMENT.md).', 'grey');
+
+        return;
+    }
+
+    out(sprintf('  %d guard(s) missing. Run "php bin/console migrate" — if the database', $failures), 'yellow');
+    out('  is up to date, restore the triggers from database/migrations/007 and 036.', 'yellow');
+    exit(1);
+}
+
+function commandAuditKeys(): void
+{
+    heading('Auditing the key generation path');
+
+    $keyPathFiles = [
+        'app/Core/Crypto.php',
+        'app/Services/ApiKeyService.php',
+        'app/Services/SessionService.php',
+        'app/Services/PasswordPolicyService.php',
+        'app/Services/DeviceService.php',
+        'app/Services/RealtimeService.php',
+        'app/Services/CsrfService.php',
+        // Issues certificate serial numbers, which have to be unpredictable:
+        // a guessable serial is one of the ingredients of a forged certificate.
+        'app/Services/TlsCertificateService.php',
+    ];
+
+    $forbidden = ['mt_rand', 'rand(', 'uniqid', 'shuffle(', 'str_shuffle', 'array_rand'];
+    $problems  = 0;
+
+    foreach ($keyPathFiles as $relative) {
+        $path = BASE_PATH . '/' . $relative;
+
+        if (!is_file($path)) {
+            out('  ⚠ missing: ' . $relative, 'yellow');
+            continue;
+        }
+
+        // Scan tokens, not raw text. A regex over the file body cannot tell a
+        // call from the comment above it explaining why the call is absent, and
+        // it flagged exactly those comments — an audit that reports a problem
+        // where the code is correct trains people to ignore it, which is worse
+        // than not running it at all. The tokenizer sees only real function
+        // names, so comments and string literals cannot produce a finding.
+        $tokens = @token_get_all((string) file_get_contents($path));
+        $found  = [];
+
+        $banned = array_map(
+            static fn (string $needle): string => strtolower(rtrim($needle, '(')),
+            $forbidden
+        );
+
+        foreach ($tokens as $index => $token) {
+            if (!is_array($token) || $token[0] !== T_STRING) {
+                continue;
+            }
+
+            $name = strtolower($token[1]);
+
+            if (!in_array($name, $banned, true)) {
+                continue;
+            }
+
+            // A bare identifier is not a call. Look ahead past whitespace for
+            // the opening parenthesis, so a method named `shuffle` on some
+            // object, or a constant, is not mistaken for the global function.
+            $next = $index + 1;
+
+            while (isset($tokens[$next]) && is_array($tokens[$next]) && $tokens[$next][0] === T_WHITESPACE) {
+                $next++;
+            }
+
+            if (($tokens[$next] ?? null) !== '(') {
+                continue;
+            }
+
+            // `$this->rand()` and `Foo::rand()` are not the global function.
+            $previous = $index - 1;
+
+            while (isset($tokens[$previous]) && is_array($tokens[$previous]) && $tokens[$previous][0] === T_WHITESPACE) {
+                $previous--;
+            }
+
+            $before = $tokens[$previous] ?? null;
+
+            if (is_array($before) && in_array($before[0], [T_OBJECT_OPERATOR, T_DOUBLE_COLON, T_FUNCTION], true)) {
+                continue;
+            }
+
+            $found[$name] = $name;
+        }
+
+        $found = array_values($found);
+
+        if ($found === []) {
+            ok(sprintf('%-46s clean', $relative));
+        } else {
+            out(sprintf('  ✗ %-44s uses %s', $relative, implode(', ', $found)), 'red');
+            $problems++;
+        }
+    }
+
+    out('');
+
+    $usesCsprng = str_contains((string) file_get_contents(BASE_PATH . '/app/Core/Crypto.php'), 'random_bytes(');
+
+    $usesCsprng
+        ? ok('Crypto::randomBytes() is backed by random_bytes().')
+        : out('  ✗ Crypto does not call random_bytes().', 'red');
+
+    // Sample the generator to confirm it produces distinct, well-formed keys.
+    heading('Sampling 1,000 generated key identifiers');
+
+    $seen = [];
+
+    for ($i = 0; $i < 1000; $i++) {
+        $seen[] = 'lsk_' . Crypto::randomBase62(8) . '.' . Crypto::randomBase62(32);
+    }
+
+    $unique = count(array_unique($seen));
+
+    $unique === 1000
+        ? ok('1,000 / 1,000 keys unique.')
+        : out(sprintf('  ✗ only %d / 1000 unique.', $unique), 'red');
+
+    $lengths = array_unique(array_map('strlen', $seen));
+    ok('Key length: ' . implode(', ', $lengths) . ' characters.');
+
+    out('');
+    $problems === 0 ? ok('Key path audit passed.') : fail($problems . ' file(s) failed the audit.');
+}
+
+function commandCreateAdmin(): void
+{
+    heading('Create an administrator account');
+
+    $db = Database::instance();
+
+    $role = $db->selectOne("SELECT role_id FROM roles WHERE role_slug = 'administrator'");
+
+    if ($role === null) {
+        fail('The administrator role does not exist. Run "php bin/console seed" first.');
+    }
+
+    $fullName = prompt('Full name');
+    $username = strtolower(prompt('Username'));
+    $email    = strtolower(prompt('Email'));
+
+    if ($fullName === '' || $username === '' || $email === '') {
+        fail('All fields are required.');
+    }
+
+    if (preg_match('/^[a-z0-9._-]{4,32}$/', $username) !== 1) {
+        fail('Username must be 4–32 characters: letters, numbers, dot, underscore or hyphen.');
+    }
+
+    if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+        fail('That email address is not valid.');
+    }
+
+    if ($db->scalar('SELECT 1 FROM users WHERE username = :u OR email = :e LIMIT 1',
+        ['u' => $username, 'e' => $email]) !== null) {
+        fail('That username or email address is already registered.');
+    }
+
+    $password = prompt('Password (blank to generate one)', true);
+    $generated = false;
+
+    if ($password === '') {
+        $password  = App\Services\PasswordPolicyService::generate();
+        $generated = true;
+    } else {
+        $issues = App\Services\PasswordPolicyService::check($password, [$username, $email, $fullName]);
+
+        if ($issues !== []) {
+            out('');
+            foreach ($issues as $issue) {
+                out('  ✗ ' . $issue, 'red');
+            }
+            exit(1);
+        }
+
+        if (prompt('Confirm password', true) !== $password) {
+            fail('Passwords do not match.');
+        }
+    }
+
+    $hash = Hash::make($password);
+
+    $userId = (int) $db->transaction(static function (Database $db) use ($role, $username, $email, $hash, $fullName, $generated): string {
+        $id = $db->insert('users', [
+            'role_id'              => (int) $role['role_id'],
+            'username'             => $username,
+            'email'                => $email,
+            'password_hash'        => $hash,
+            'full_name'            => $fullName,
+            'status'               => 'active',
+            // Only force a change when the console generated the password.
+            // Somebody who typed their own, at this prompt, seconds ago has
+            // already chosen it — making them choose again teaches nothing and
+            // is one more thing to go wrong in front of an audience. A
+            // generated password is different: it has been printed to a
+            // terminal and possibly a scrollback buffer, so it must not stay.
+            'must_change_password' => $generated ? 1 : 0,
+            'password_changed_at'  => Clock::nowString(),
+            'created_at'           => Clock::nowString(),
+            'updated_at'           => Clock::nowString(),
+        ]);
+
+        $db->insert('password_history', [
+            'user_id'       => (int) $id,
+            'password_hash' => $hash,
+            'created_at'    => Clock::nowString(),
+        ]);
+
+        return $id;
+    });
+
+    out('');
+    ok('Administrator #' . $userId . ' created.');
+    out('');
+    out('  Username: ' . $username, 'cyan');
+
+    if ($generated) {
+        out('  Password: ' . $password, 'cyan');
+        out('');
+        out('  This is the only time the password is shown. You will be asked', 'yellow');
+        out('  to change it the first time you sign in.', 'yellow');
+    } else {
+        out('  Password: (as entered)', 'grey');
+    }
+
+    out('');
+}
+
+/**
+ * Give every teacher who has no login one, with their first name as username.
+ *
+ *   console.bat user:create-teachers
+ *   console.bat user:create-teachers --yes
+ *
+ * A teacher record and a user account are separate rows, and a teacher can
+ * exist without one: schedule:grade3 creates the staff a timetable names, and
+ * so does any bulk load. Those teachers appear correctly on the timetable, own
+ * their sections and can have their fingerprints enrolled — and cannot sign
+ * in, because nothing ever issued them a password. Before this command the
+ * only route was to delete the teacher and re-create them through the
+ * registration form, which would have taken their schedules with them.
+ *
+ * The password is generated, printed once, and never recoverable afterwards —
+ * the same rule the registration form follows. Each teacher is committed on
+ * their own, so a name that collides does not cost the others their accounts.
+ *
+ * @param list<string> $flags
+ */
+function commandCreateTeacherAccounts(array $flags): void
+{
+    $db = Database::instance();
+
+    heading('Teacher login accounts');
+
+    $teachers = $db->select(
+        "SELECT teacher_id, first_name, last_name, email
+           FROM teachers
+          WHERE user_id IS NULL AND status = 'active' AND deleted_at IS NULL
+          ORDER BY last_name, first_name"
+    );
+
+    if ($teachers === []) {
+        ok('Every active teacher already has an account. Nothing to do.');
+        out('');
+
+        return;
+    }
+
+    // Chosen before anything is written, so the confirmation below shows the
+    // usernames that will actually be created rather than the ones asked for.
+    $taken   = [];
+    $planned = [];
+
+    foreach ($teachers as $teacher) {
+        $username = teacherUsername(
+            (string) $teacher['first_name'],
+            (string) $teacher['last_name'],
+            $taken
+        );
+
+        $taken[]   = $username;
+        $planned[] = $teacher + ['username' => $username];
+    }
+
+    out(sprintf('  %d teacher(s) have no account:', count($planned)), 'grey');
+    out('');
+
+    foreach ($planned as $row) {
+        out(sprintf(
+            '    %-28s -> %s',
+            $row['first_name'] . ' ' . $row['last_name'],
+            $row['username']
+        ));
+    }
+
+    out('');
+
+    if (!in_array('--yes', $flags, true)) {
+        out('  Each gets a generated password, shown once and never again.', 'yellow');
+
+        if (strtolower(prompt('  Create these accounts? (yes/no)')) !== 'yes') {
+            out('');
+            out('  Nothing was created.', 'grey');
+            out('');
+
+            return;
+        }
+    }
+
+    $adminId = (int) $db->scalar(
+        "SELECT u.user_id FROM users u JOIN roles r ON r.role_id = u.role_id
+          WHERE r.role_slug = 'administrator' AND u.deleted_at IS NULL
+          ORDER BY u.user_id LIMIT 1"
+    );
+
+    $issued = [];
+    $failed = [];
+
+    foreach ($planned as $row) {
+        try {
+            $issued[] = App\Services\UserRegistrationService::issueAccountToTeacher(
+                (int) $row['teacher_id'],
+                (string) $row['username'],
+                $adminId
+            ) + ['name' => $row['first_name'] . ' ' . $row['last_name']];
+        } catch (Throwable $e) {
+            $failed[] = $row['first_name'] . ' ' . $row['last_name'] . ': ' . $e->getMessage();
+        }
+    }
+
+    out('');
+    ok(sprintf('%d account(s) created.', count($issued)));
+    out('');
+
+    if ($issued !== []) {
+        $width = max(array_map(static fn (array $r): int => strlen((string) $r['name']), $issued));
+
+        out('  ' . str_pad('Teacher', $width) . '  ' . str_pad('Username', 16) . '  Password', 'bold');
+        out('  ' . str_repeat('─', $width + 18 + 20), 'grey');
+
+        foreach ($issued as $row) {
+            out(sprintf(
+                '  %s  %s  %s',
+                str_pad((string) $row['name'], $width),
+                str_pad((string) $row['username'], 16),
+                (string) $row['password']
+            ), 'cyan');
+        }
+
+        out('');
+        out('  This is the only time these passwords are shown. Write them down or', 'yellow');
+        out('  print this screen now — there is no way to read them back, only to', 'yellow');
+        out('  reset them. Each teacher must change theirs at first sign-in.', 'yellow');
+    }
+
+    foreach ($failed as $message) {
+        out('  ✗ ' . $message, 'red');
+    }
+
+    out('');
+}
+
+/**
+ * The username for a teacher: their first name, lowercased.
+ *
+ * Two things force the fallbacks. The users table requires 4–32 characters of
+ * [a-z0-9._-], so a two-letter first name has to borrow from the surname; and
+ * usernames are unique across archived accounts as well as live ones, so a
+ * second Ericka cannot simply be "ericka". Uniqueness is checked against the
+ * database AND against the names already chosen in this run, because none of
+ * those exist yet.
+ *
+ * @param list<string> $reserved
+ */
+function teacherUsername(string $first, string $last, array $reserved): string
+{
+    $clean = static fn (string $value): string => (string) preg_replace(
+        '/[^a-z0-9]/',
+        '',
+        mb_strtolower(trim($value))
+    );
+
+    $base = $clean($first);
+    $tail = $clean($last);
+
+    if ($base === '') {
+        $base = $tail !== '' ? $tail : 'teacher';
+    }
+
+    // Too short for the column's rule: take enough of the surname to reach the
+    // minimum rather than padding with something meaningless.
+    if (strlen($base) < 4) {
+        $base = substr($base . $tail, 0, 4) ?: 'user';
+    }
+
+    $base = substr($base, 0, 30);
+
+    $free = static function (string $candidate) use ($reserved): bool {
+        if (in_array($candidate, $reserved, true)) {
+            return false;
+        }
+
+        return Database::instance()->scalar(
+            'SELECT 1 FROM users WHERE username = :u LIMIT 1',
+            ['u' => $candidate]
+        ) === null;
+    };
+
+    if ($free($base)) {
+        return $base;
+    }
+
+    // A surname initial reads better than a number, and is what a person
+    // would have picked: ericka, then erickav.
+    if ($tail !== '' && $free($base . $tail[0])) {
+        return $base . $tail[0];
+    }
+
+    for ($n = 2; $n < 100; $n++) {
+        if ($free($base . $n)) {
+            return $base . $n;
+        }
+    }
+
+    fail('Could not find a free username for ' . $first . ' ' . $last . '.');
+}
+
+/**
+ * Turn a .sql.gz.lsiams (or older .sql.gz.enc) backup archive into readable SQL.
+ *
+ * The admin Backups page can only restore archives it has a database row for,
+ * and that row lives in the database — so it is missing precisely when the
+ * backup is needed. This reads the file directly. It needs the APP_KEY the
+ * archive was written with, which is why .env must be kept alongside the
+ * backups and never regenerated while an archive still matters.
+ *
+ * @param list<string> $arguments
+ */
+function commandBackupDecrypt(array $arguments): void
+{
+    $paths  = array_values(array_filter($arguments, static fn (string $a): bool => !str_starts_with($a, '--')));
+    $source = $paths[0] ?? '';
+
+    if ($source === '') {
+        fail("Usage: php bin/console backup:decrypt <file.sql.gz.lsiams> [output.sql]\n"
+           . '  Writes the SQL next to the archive when no output path is given.');
+    }
+
+    if (!is_file($source)) {
+        $candidate = BASE_PATH . '/database/backups/' . basename($source);
+
+        if (!is_file($candidate)) {
+            fail('No such file: ' . $source);
+        }
+
+        $source = $candidate;
+    }
+
+    // Both suffixes: archives written before the extension changed are
+    // still '.sql.gz.enc' and must keep decrypting exactly as they did.
+    $target = $paths[1] ?? preg_replace('/\.sql\.gz\.(enc|lsiams)$/', '.sql', $source);
+
+    if (!is_string($target) || $target === '' || $target === $source) {
+        $target = $source . '.sql';
+    }
+
+    heading('Decrypting ' . basename($source));
+
+    try {
+        $sql = BackupService::decryptFile($source);
+    } catch (Throwable $e) {
+        out('');
+        out('  If the message mentions decryption, the APP_KEY in .env is not the one', 'grey');
+        out('  this archive was written with. There is no way around that.', 'grey');
+        out('');
+        fail($e->getMessage());
+    }
+
+    if (file_put_contents($target, $sql) === false) {
+        fail('Could not write ' . $target);
+    }
+
+    @chmod($target, 0600);
+
+    ok(number_format(strlen($sql)) . ' bytes written to ' . $target);
+    out('');
+    out('  Load it with:  php bin/console db:import ' . escapeshellarg($target), 'cyan');
+    out('  It contains real data — delete it once the import has worked.', 'grey');
+}
+
+/**
+ * Bring an installation's data over from the MariaDB version of L-SIAMS.
+ *
+ *   php bin/console db:import-mysql
+ *       Reads the MariaDB database the old .env points at (DB_HOST, DB_PORT,
+ *       DB_NAME, DB_USER, DB_PASS). MySQL has to be running for this one.
+ *
+ *   php bin/console db:import-mysql --from-file=<file>
+ *       Reads a dump instead, with no MariaDB needed: a phpMyAdmin export, a
+ *       mysqldump (.sql or .sql.gz), or a backup the MariaDB version made
+ *       (.sql.gz.lsiams) — decrypted with the APP_KEY in this .env, which is
+ *       why the .env has to come across from the old installation.
+ *
+ * The new database is built beside the real one and moved into place only
+ * after every table has been checked row for row; see MariaDbImporter. With
+ * --force an existing database is set aside (renamed, never deleted).
+ *
+ * @param list<string> $arguments
+ * @param list<string> $flags
+ */
+function commandDbImportMysql(array $arguments, array $flags): void
+{
+    @ini_set('memory_limit', '1024M');
+    @set_time_limit(0);
+
+    $file     = null;
+    $timeZone = null;
+
+    foreach (array_merge($arguments, $flags) as $argument) {
+        if (str_starts_with($argument, '--from-file=')) {
+            $file = substr($argument, strlen('--from-file='));
+        }
+
+        if (str_starts_with($argument, '--timezone=')) {
+            $timeZone = substr($argument, strlen('--timezone='));
+
+            if (preg_match('/^[+-]\d{2}:\d{2}$/', $timeZone) !== 1) {
+                fail('--timezone takes an offset like +00:00 or +08:00.');
+            }
+        }
+    }
+
+    heading('Importing from the MariaDB version');
+
+    try {
+        if ($file !== null && $file !== '') {
+            if (!is_file($file) && is_file(BASE_PATH . '/' . ltrim($file, '/\\'))) {
+                $file = BASE_PATH . '/' . ltrim($file, '/\\');
+            }
+
+            $source = new App\Services\Import\MariaDbDumpSource($file, $timeZone);
+        } else {
+            /** @var array{host:string,port:int,database:string,username:string,password:string} $config */
+            $config = (array) Config::get('database.mysql_source', []);
+            $source = new App\Services\Import\LiveMariaDbSource([
+                'host'     => (string) ($config['host'] ?? '127.0.0.1'),
+                'port'     => (int) ($config['port'] ?? 3306),
+                'database' => (string) ($config['database'] ?? 'lsiams_db'),
+                'username' => (string) ($config['username'] ?? 'lsiams_app'),
+                'password' => (string) ($config['password'] ?? ''),
+            ]);
+        }
+
+        $importer = new App\Services\Import\MariaDbImporter($source, static function (string $line): void {
+            out('  ' . $line, 'grey');
+        });
+
+        $started = microtime(true);
+        $report  = $importer->run((string) Config::get('database.path'), in_array('--force', $flags, true));
+    } catch (Throwable $e) {
+        out('');
+        out('  Nothing was changed.', 'yellow');
+        fail($e->getMessage());
+    }
+
+    out('');
+
+    foreach ($report['per_table'] as $table => $count) {
+        if ($count > 0) {
+            out(sprintf('  %-34s %8s', $table, number_format($count)), 'grey');
+        }
+    }
+
+    out('');
+    ok(sprintf('%s rows in %d tables copied and verified in %.1fs.', number_format($report['rows']), $report['tables'], microtime(true) - $started));
+    ok('Database: ' . $report['path']);
+
+    if ($report['migrations_after'] !== []) {
+        ok('Brought up to date with ' . count($report['migrations_after']) . ' newer migration(s).');
+    }
+
+    if ($report['previous'] !== null) {
+        out('  The database that was there before is kept as ' . basename($report['previous']), 'grey');
+    }
+
+    if ($source instanceof App\Services\Import\MariaDbDumpSource && ($note = $source->timeZoneNote()) !== null) {
+        out('');
+        out('  ' . wordwrap($note, 76, "\n  "), 'yellow');
+    }
+
+    if ($report['orphans'] !== []) {
+        out('');
+        out('  Copied as they were, but worth a look: rows whose parent row is missing', 'yellow');
+        out('  (the old database already had these; nothing here created them):', 'yellow');
+
+        foreach ($report['orphans'] as $what => $count) {
+            out(sprintf('    %d in %s', $count, $what), 'yellow');
+        }
+    }
+
+    out('');
+    out('  Next: start L-SIAMS with start.bat and sign in as before.', 'cyan');
+    out('');
+}
+
+/**
+ * Replace the database with the contents of a SQLite .sql dump — the file
+ * `backup:decrypt` writes, or one made with the sqlite3 tool's .dump.
+ *
+ * The whole file runs as one transaction after everything currently in the
+ * database is dropped, so an import that fails part-way changes nothing, and
+ * one that succeeds leaves exactly what the file describes. When a statement
+ * fails it is the statement that is reported, not just an error number.
+ *
+ * A file from the MariaDB version — a phpMyAdmin export, a mysqldump, a
+ * decrypted MariaDB-era backup — is SQL for a different database and is sent
+ * to `db:import-mysql`, which reads it row by row into this schema instead.
+ *
+ * @param list<string> $arguments
+ * @param list<string> $flags
+ */
+function commandDbImport(array $arguments, array $flags): void
+{
+    $paths = array_values(array_filter($arguments, static fn (string $a): bool => !str_starts_with($a, '--')));
+    $path  = $paths[0] ?? '';
+
+    if ($path === '') {
+        fail("Usage: php bin/console db:import <file.sql> [--force]\n"
+           . '  Replaces the whole database with the file. --force is needed when the database already holds data.');
+    }
+
+    if (!is_file($path)) {
+        $candidate = BASE_PATH . '/' . ltrim($path, '/\\');
+
+        if (!is_file($candidate)) {
+            fail('No such file: ' . $path);
+        }
+
+        $path = $candidate;
+    }
+
+    $sql = (string) file_get_contents($path);
+
+    // A backup archive or a gzipped dump is opened here, so any of them can be
+    // dropped onto import.bat without decrypting it first.
+    try {
+        if (str_starts_with($sql, 'LSIAMSBK')) {
+            $sql = BackupService::decryptFile($path);
+        } elseif (str_starts_with($sql, "\x1f\x8b")) {
+            $sql = (string) gzdecode($sql);
+        }
+    } catch (Throwable $e) {
+        fail('The file could not be opened: ' . (($e instanceof App\Core\Exceptions\ValidationException) ? $e->firstMessage() : $e->getMessage())
+           . "\n  A backup only opens with the APP_KEY it was made under — the .env from that installation.");
+    }
+
+    // An editor that saved it as UTF-8 with a byte order mark puts three junk
+    // characters in front of the first statement.
+    $sql = (string) preg_replace('/^\xEF\xBB\xBF/', '', $sql);
+
+    // SQL for the MariaDB version — a phpMyAdmin export, a mysqldump, a backup
+    // taken before the move — is rebuilt row by row by the MariaDB importer.
+    if (BackupService::isMariaDbDump($sql)) {
+        out('  This file is from the MariaDB version; importing it with db:import-mysql.', 'grey');
+        unset($sql);
+        commandDbImportMysql(['--from-file=' . $path], $flags);
+
+        return;
+    }
+
+    if (trim($sql) === '') {
+        fail('The file is empty. If it was copied out of a browser, check it was not truncated.');
+    }
+
+    $db = Database::instance();
+
+    heading('Importing ' . basename($path) . ' into ' . basename($db->path()));
+
+    $hasData = false;
+
+    try {
+        $hasData = (int) $db->scalar('SELECT COUNT(*) FROM users') > 0;
+    } catch (Throwable) {
+        // No users table: an empty or new database, nothing to protect.
+    }
+
+    if ($hasData && !in_array('--force', $flags, true) && !in_array('--fresh', $flags, true)) {
+        fail("The database already holds data, and importing replaces all of it.\n"
+           . '  Take a backup first (php bin/console backup), then re-run with --force.');
+    }
+
+    try {
+        $tables = BackupService::replaceDatabaseWith($sql);
+    } catch (Throwable $e) {
+        out('');
+        out('  Nothing was changed: the import runs as one transaction and was rolled back.', 'yellow');
+        fail(($e->getPrevious() ?? $e)->getMessage());
+    }
+
+    // A file written against an older release leaves the newer migrations
+    // unapplied, and the pages that need them break in ways that look nothing
+    // like an import problem. Say so here rather than letting them find out.
+    $pending = [];
+
+    try {
+        ensureMigrationsTable($db);
+        $applied = array_column($db->select('SELECT migration FROM schema_migrations'), 'migration');
+
+        foreach (discoverMigrations() as $migration) {
+            if (!in_array($migration['name'], $applied, true)) {
+                $pending[] = $migration['name'];
+            }
+        }
+    } catch (Throwable) {
+        // Nothing to report if the table could not be read.
+    }
+
+    out('');
+    ok($tables . ' table(s) imported.');
+
+    if ($pending !== []) {
+        out('');
+        out('  ' . count($pending) . ' migration(s) in this release are not in that file:', 'yellow');
+
+        foreach ($pending as $name) {
+            out('    ' . $name, 'yellow');
+        }
+
+        out('');
+        out('  Apply them now:  php bin/console migrate', 'cyan');
+    }
+}
+
+/**
+ * Move the application's clock, for testing a schedule without waiting for it.
+ *
+ *   time:shift "+2 hours"      run two hours ahead
+ *   time:shift "next monday 08:05"
+ *   time:shift --clear         back to real time
+ *   time:shift                 show where the clock currently is
+ *
+ * @param list<string> $arguments
+ * @param list<string> $flags
+ */
+function commandTimeShift(array $arguments, array $flags): void
+{
+    $envFile = BASE_PATH . '/.env';
+
+    if (!is_file($envFile)) {
+        fail('.env does not exist yet. Run install first.');
+    }
+
+    $values = array_values(array_filter($arguments, static fn (string $a): bool => !str_starts_with($a, '--')));
+    $clear  = in_array('--clear', $flags, true);
+    $spec   = $clear ? '' : trim($values[0] ?? '');
+
+    heading('Application clock');
+
+    // No argument: report, change nothing.
+    if ($spec === '' && !$clear) {
+        $current = Clock::offset();
+
+        out('  Real time         ' . Clock::real()->format('D d M Y H:i:s'));
+        out('  Application time  ' . Clock::now()->format('D d M Y H:i:s'), $current === '' ? '' : 'yellow');
+        out('');
+
+        $current === ''
+            ? ok('The clock is not shifted.')
+            : out('  Shift: ' . $current, 'yellow');
+
+        if (Env::get('APP_ENV', 'production') === 'production' && Env::get('APP_CLOCK_OFFSET', '') !== '') {
+            out('');
+            out('  APP_CLOCK_OFFSET is set but ignored — APP_ENV is production.', 'yellow');
+        }
+
+        return;
+    }
+
+    if ($spec !== '' && !Clock::isValidOffset($spec)) {
+        // "+8h" is the mistake worth naming: PHP parses it, ignores it, and
+        // leaves the clock where it was, so it used to be accepted and then
+        // quietly do nothing.
+        fail('"' . $spec . '" does not move the clock. Single-letter units are '
+           . 'silently ignored by PHP — write the unit out: "+8 hours", not "+8h"; '
+           . '"+30 minutes", not "+30m". "next monday 08:05" also works.');
+    }
+
+    $contents = (string) file_get_contents($envFile);
+
+    $contents = preg_match('/^APP_CLOCK_OFFSET=.*$/m', $contents) === 1
+        ? (string) preg_replace('/^APP_CLOCK_OFFSET=.*$/m', 'APP_CLOCK_OFFSET=' . $spec, $contents)
+        : rtrim($contents) . PHP_EOL . 'APP_CLOCK_OFFSET=' . $spec . PHP_EOL;
+
+    file_put_contents($envFile, $contents);
+    @chmod($envFile, 0600);
+
+    if ($spec === '') {
+        ok('Cleared. The application is back on real time.');
+    } else {
+        ok('Shift set to "' . $spec . '".');
+        out('  Real time is ' . Clock::real()->format('D d M Y H:i:s')
+            . ', so the application will read '
+            . Clock::real()->modify($spec)->format('D d M Y H:i:s') . '.', 'grey');
+    }
+
+    out('');
+    out('  Restart start.bat — the running server read .env when it started.', 'cyan');
+
+    if (Env::get('APP_ENV', 'production') === 'production' && $spec !== '') {
+        out('');
+        out('  APP_ENV is production, so this will be ignored. Set APP_ENV=local in', 'yellow');
+        out('  .env while you are testing, and put it back afterwards.', 'yellow');
+    }
+}
+
+/**
+ * Erase a user row and everything that points at it.
+ *
+ * This exists because the database will not let you do it by hand, and the
+ * ways round that by hand are worse than the problem. `audit_logs`,
+ * `login_history` and `security_logs` each hold the user with ON DELETE
+ * RESTRICT *and* carry a BEFORE DELETE trigger that raises SQLSTATE 45000, so
+ * the only route through is to drop those triggers first. An administrator
+ * doing that in phpMyAdmin who then hits an error partway — or simply closes
+ * the tab — leaves the audit table permanently unprotected, and nothing
+ * anywhere says so. That is a far worse outcome than the stuck row they were
+ * trying to fix.
+ *
+ * So the trigger drop happens here, after a confirmation that shows exactly
+ * what will be destroyed, and inside one transaction with the deletes and the
+ * triggers' return. SQLite rolls DDL back like any other write, so the purge
+ * either completes with the guards back in place or does not happen at all —
+ * there is no moment at which the audit table is left unprotected.
+ *
+ * Archiving remains the right answer almost every time — it ends the sessions,
+ * blocks the login and keeps the history. This is for the account created by
+ * mistake that should never have existed.
+ *
+ * @param list<string> $arguments
+ * @param list<string> $flags
+ */
+function commandUserPurge(array $arguments, array $flags): void
+{
+    $db     = Database::instance();
+    $userId = (int) ($arguments[0] ?? 0);
+
+    if ($userId <= 0) {
+        fail('Give the numeric user id: php bin/console user:purge 3');
+    }
+
+    $user = $db->selectOne(
+        'SELECT u.*, r.role_slug, r.role_name
+           FROM users u JOIN roles r ON r.role_id = u.role_id
+          WHERE u.user_id = :id',
+        ['id' => $userId]
+    );
+
+    if ($user === null) {
+        fail(sprintf('No user with id %d.', $userId));
+    }
+
+    heading(sprintf('Purge user %d — %s', $userId, (string) $user['username']));
+
+    out(sprintf('  %-14s %s', 'Name', (string) ($user['full_name'] ?? '—')), 'grey');
+    out(sprintf('  %-14s %s', 'Email', (string) ($user['email'] ?? '—')), 'grey');
+    out(sprintf('  %-14s %s', 'Role', (string) $user['role_name']), 'grey');
+    out(sprintf('  %-14s %s', 'Status', (string) $user['status']), 'grey');
+
+    // The same rule the application enforces. Losing the last administrator
+    // locks everybody out with no recovery short of editing the database, and
+    // this command is meant to keep people out of the database.
+    if (strtolower((string) $user['role_slug']) === 'administrator') {
+        $remaining = (int) $db->scalar(
+            "SELECT COUNT(*) FROM users u JOIN roles r ON r.role_id = u.role_id
+              WHERE r.role_slug = 'administrator' AND u.status = 'active'
+                AND u.deleted_at IS NULL AND u.user_id <> :id",
+            ['id' => $userId]
+        );
+
+        if ($remaining === 0) {
+            fail('This is the last active administrator. Purging it would lock everyone out permanently.');
+        }
+    }
+
+    // Everything that would be destroyed outright, rather than detached. These
+    // are the tables holding the user with ON DELETE RESTRICT.
+    $destroys = [
+        'audit_logs'                     => 'user_id',
+        'login_history'                  => 'user_id',
+        'security_logs'                  => 'user_id',
+        'attendance_modifications'       => 'administrator_id',
+        'student_section_history'        => 'performed_by',
+        'generated_reports'              => 'generated_by',
+        'teacher_department_exceptions'  => 'granted_by',
+        'teacher_grade_level_exceptions' => 'granted_by',
+    ];
+
+    heading('Rows that will be destroyed permanently');
+
+    $total = 0;
+
+    foreach ($destroys as $table => $column) {
+        $count = (int) $db->scalar(
+            sprintf('SELECT COUNT(*) FROM `%s` WHERE `%s` = :id', $table, $column),
+            ['id' => $userId]
+        );
+
+        $total += $count;
+
+        out(sprintf('  %-34s %6d', $table, $count), $count > 0 ? 'yellow' : 'grey');
+    }
+
+    out('');
+    out(sprintf('  %-34s %6d', 'total', $total), $total > 0 ? 'yellow' : 'grey');
+
+    if ($total > 0) {
+        out('');
+        out('  These cannot be recovered from a backup taken after the purge.', 'yellow');
+        out('  Archiving instead keeps every one of them and still blocks the login.', 'grey');
+    }
+
+    if (!in_array('--force', $flags, true)) {
+        out('');
+        out('  Dry run — nothing has been changed.', 'cyan');
+        out('  Re-run with --force to carry it out:', 'grey');
+        out(sprintf('    php bin/console user:purge %d --force', $userId), 'grey');
+        out('');
+
+        return;
+    }
+
+    out('');
+    $typed = prompt(sprintf('  Type the username "%s" to confirm', (string) $user['username']));
+
+    if (!hash_equals((string) $user['username'], $typed)) {
+        fail('Confirmation did not match. Nothing was changed.');
+    }
+
+    // Recorded before the rows go, because afterwards there is nothing left to
+    // describe and no way to tell the purge happened at all.
+    App\Services\AuditService::log(
+        'user.purged',
+        'user_management',
+        'user',
+        $userId,
+        [
+            'username' => (string) $user['username'],
+            'email'    => (string) ($user['email'] ?? ''),
+            'role'     => (string) $user['role_name'],
+            'status'   => (string) $user['status'],
+        ],
+        null,
+        sprintf(
+            'Account "%s" (id %d) purged from the console along with %d referencing row(s).',
+            (string) $user['username'],
+            $userId,
+            $total
+        ),
+        'success',
+        null
+    );
+
+    $guards = ['audit_logs' => 'trg_audit_no_delete',
+               'security_logs' => 'trg_security_no_delete',
+               'login_history' => 'trg_login_history_no_delete'];
+
+    heading('Purging');
+
+    $db->transaction(static function (Database $db) use ($guards, $destroys, $userId): void {
+        foreach ($guards as $trigger) {
+            $db->execute(sprintf('DROP TRIGGER IF EXISTS "%s"', $trigger));
+        }
+
+        foreach ($destroys as $table => $column) {
+            $db->execute(
+                sprintf('DELETE FROM "%s" WHERE "%s" = :id', $table, $column),
+                ['id' => $userId]
+            );
+        }
+
+        // Everything else either cascades or is set to NULL by the schema, so
+        // the user row goes last and takes the rest with it.
+        $db->execute('DELETE FROM users WHERE user_id = :id', ['id' => $userId]);
+
+        // In the same transaction: if anything above failed, the drops roll
+        // back with it and the guards were never gone.
+        restoreImmutabilityTriggers($db);
+    });
+
+    ok(sprintf('user %d purged, %d referencing row(s) destroyed', $userId, $total));
+    out('  immutability triggers lifted and restored inside the same transaction', 'grey');
+
+    out('');
+}
+
+/**
+ * Put the three no-delete guards back exactly as migration 007 defines them.
+ *
+ * Kept beside the purge rather than re-running the migration: 007 is recorded
+ * as applied, so `migrate` will not run it again, and an administrator who
+ * needed this would have no way to get the protection back.
+ */
+function restoreImmutabilityTriggers(Database $db): void
+{
+    $guards = [
+        'trg_audit_no_delete'         => ['audit_logs', 'Audit logs are immutable and cannot be deleted.'],
+        'trg_security_no_delete'      => ['security_logs', 'Security logs are immutable and cannot be deleted.'],
+        'trg_login_history_no_delete' => ['login_history', 'Login history is permanent and cannot be deleted.'],
+    ];
+
+    foreach ($guards as $trigger => [$table, $message]) {
+        $db->execute(sprintf('DROP TRIGGER IF EXISTS %s', $trigger));
+        $db->execute(sprintf(
+            "CREATE TRIGGER %s BEFORE DELETE ON %s
+             BEGIN
+                 SELECT RAISE(ABORT, '%s');
+             END",
+            $trigger,
+            $table,
+            $message
+        ));
+    }
+}
+
+/**
+ * Work through every condition a fingerprint has to satisfy to open a session,
+ * and say which one is not met.
+ *
+ * "It does not start" has meant a different thing each time it has been said:
+ * the terminal throttled, the print matching a template the server had
+ * forgotten, no schedule covering the moment, the terminal bound to the wrong
+ * room. Each looks identical from the outside — a finger on the sensor and
+ * nothing happening — and each needed a different fix. The checks are all
+ * cheap; what was missing was somewhere to read them together.
+ *
+ * Deliberately read-only. It opens nothing and changes nothing, so it is safe
+ * to run against a system a class is waiting on.
+ *
+ * @param list<string> $arguments
+ */
+/**
+ * Show which terminals are being rate limited, and lift it.
+ *
+ * A block is held on the server, in `rate_limits`, so it survives everything
+ * somebody standing at the terminal can do to it: resetting the board,
+ * re-flashing it, power-cycling the whole classroom. Until this existed the
+ * only ways out were to wait the window out — which does not help a board that
+ * re-trips it immediately — or to edit the database by hand.
+ *
+ * Printing the counts first is the point of the command as much as clearing
+ * them. "Why was it blocked" is answered by how far over the limit it went: a
+ * terminal a few requests over is doing its job on too small a budget, and one
+ * thousands over is stuck in a retry loop and will be blocked again a minute
+ * after this command is run.
+ *
+ * @param list<string>        $arguments
+ * @param array<string,mixed> $flags
+ */
+function commandDeviceUnblock(array $arguments, array $flags): void
+{
+    $db  = Database::instance();
+    $all = in_array('--all', $flags, true);
+
+    // $arguments still carries the flags, so the device id is the first thing
+    // that is not one — otherwise `device:unblock --all` reads "--all" as the
+    // name of a terminal and reports that no such terminal is limited.
+    $positional = array_values(array_filter(
+        $arguments,
+        static fn (string $a): bool => !str_starts_with($a, '--')
+    ));
+
+    $selector = $positional[0] ?? '';
+
+    $buckets = Config::get('security.rate_limit', []);
+
+    heading('Rate limits');
+
+    $rows = $db->select('SELECT bucket_key, hits, window_start, blocked_until FROM rate_limits ORDER BY bucket_key');
+
+    if ($rows === []) {
+        out('  Nothing is rate limited. No terminal is being refused for this reason.', 'green');
+        out('');
+
+        return;
+    }
+
+    // The bucket key is the name plus a hash of the subject, so the device id
+    // cannot be read back out of it — it has to be hashed and compared. That is
+    // deliberate: the table holds no device identifiers in the clear.
+    $subjectKey = static function (string $bucket, string $subject): string {
+        return $bucket . ':' . hash('sha256', $subject);
+    };
+
+    $known = [];
+
+    foreach ($db->select('SELECT device_id FROM devices') as $device) {
+        foreach (array_keys($buckets) as $bucket) {
+            $known[$subjectKey((string) $bucket, (string) $device['device_id'])] = [
+                'device' => (string) $device['device_id'],
+                'bucket' => (string) $bucket,
+            ];
+        }
+    }
+
+    $now     = Clock::now();
+    $matched = [];
+
+    foreach ($rows as $row) {
+        $key   = (string) $row['bucket_key'];
+        $owner = $known[$key] ?? null;
+        $name  = $owner === null ? '(not a terminal)' : $owner['device'];
+        $label = $owner === null ? explode(':', $key)[0] : $owner['bucket'];
+
+        $limit   = (int) ($buckets[$label]['limit'] ?? 0);
+        $blocked = $row['blocked_until'] !== null && Clock::parse((string) $row['blocked_until']) > $now;
+
+        if ($selector !== '' && $name !== $selector) {
+            continue;
+        }
+
+        $matched[] = $key;
+
+        out(sprintf('  %-16s %-14s %s of %s request(s)%s',
+            $name,
+            $label,
+            (int) $row['hits'],
+            $limit > 0 ? (string) $limit : 'no',
+            $blocked
+                ? sprintf('  — BLOCKED for another %d second(s)',
+                    max(1, Clock::parse((string) $row['blocked_until'])->getTimestamp() - $now->getTimestamp()))
+                : ''
+        ), $blocked ? 'red' : 'grey');
+
+        if ($blocked && $limit > 0 && (int) $row['hits'] > $limit * 4) {
+            out(sprintf('    %d times over the limit — this terminal is retrying in a loop, and clearing '
+                . 'the block will not keep it clear. Read its Serial Monitor.', intdiv((int) $row['hits'], $limit)), 'yellow');
+        }
+    }
+
+    out('');
+
+    if ($matched === []) {
+        fail(sprintf('Nothing is rate limited for "%s". Pass a device id, or nothing to see them all.', $selector));
+    }
+
+    if (!$all && $selector === '') {
+        out('  Pass a device id to lift one, or --all to lift every block above.', 'cyan');
+        out('');
+
+        return;
+    }
+
+    $db->execute(
+        'DELETE FROM rate_limits WHERE bucket_key IN (' . implode(',', array_fill(0, count($matched), '?')) . ')',
+        $matched
+    );
+
+    App\Services\AuditService::log(
+        'rate_limit.cleared',
+        'security',
+        'system',
+        null,
+        null,
+        [
+            'buckets' => count($matched),
+            'device'  => $selector !== '' ? $selector : 'all',
+        ],
+        sprintf('Rate limit lifted for %s from the console.',
+            $selector !== '' ? $selector : 'every blocked subject')
+    );
+
+    out(sprintf('✓ %d block(s) lifted. The terminal may speak again immediately.', count($matched)), 'green');
+    out('  It does not need resetting; the block was here, not on the board.', 'grey');
+    out('');
+}
+
+function commandSessionWhy(array $arguments): void
+{
+    $db       = Database::instance();
+    $selector = $arguments[0] ?? '';
+
+    $devices = $selector === ''
+        ? $db->select('SELECT device_row_id FROM v_device_status ORDER BY device_id')
+        : $db->select(
+            'SELECT device_row_id FROM v_device_status WHERE device_id = :sel OR device_row_id = :num',
+            ['sel' => $selector, 'num' => (int) $selector]
+        );
+
+    if ($devices === []) {
+        fail($selector === ''
+            ? 'No terminals are registered.'
+            : sprintf('No terminal matches "%s". Pass a device id, or nothing to check them all.', $selector));
+    }
+
+    $now = Clock::now();
+
+    heading('Right now');
+    out(sprintf('  %-22s %s', 'Server time', $now->format('D d M Y H:i:s')), 'grey');
+    out(sprintf('  %-22s %s', 'Day', $now->format('l')), 'grey');
+
+    if (Clock::isShifted()) {
+        out(sprintf('  %-22s %s (real time is %s)', 'Clock shift', 'ACTIVE', Clock::real()->format('D d M Y H:i:s')), 'yellow');
+    }
+
+    foreach ($devices as $row) {
+        $device = $db->selectOne(
+            'SELECT * FROM v_device_status WHERE device_row_id = :id',
+            ['id' => (int) $row['device_row_id']]
+        );
+
+        if ($device === null) {
+            continue;
+        }
+
+        heading(sprintf('%s — %s', (string) $device['device_id'], (string) $device['device_name']));
+
+        $blockers = [];
+
+        // --- the terminal itself ---
+        if ((string) $device['claim_status'] !== 'claimed') {
+            $blockers[] = 'The terminal has not claimed its key yet, so it cannot sign any request. '
+                        . 'Flash it with its provisioning file and let it claim.';
+        }
+
+        if ((string) $device['configured_status'] !== 'active') {
+            $blockers[] = sprintf('The terminal is set to "%s" rather than active.', $device['configured_status']);
+        }
+
+        $seen = $device['seconds_since_heartbeat'] === null
+            ? 'never'
+            : sprintf('%d s ago', (int) $device['seconds_since_heartbeat']);
+
+        out(sprintf('  %-22s %s', 'Claim', $device['claim_status']), 'grey');
+        out(sprintf('  %-22s %s (last heartbeat %s)', 'Health', $device['health'], $seen),
+            (string) $device['health'] === 'online' ? 'grey' : 'yellow');
+
+        if ((string) $device['health'] !== 'online') {
+            // Not fatal on its own — a verify arriving from a terminal that has
+            // been quiet still opens a session — but it is nearly always the
+            // visible end of something else, so it is worth saying plainly.
+            out('    A terminal that is not heartbeating is usually not reaching the server at all.', 'grey');
+            out('    Check its serial output: a 429 there means it is being throttled.', 'grey');
+        }
+
+        // --- the classroom binding ---
+        if ($device['classroom_id'] === null) {
+            $blockers[] = 'The terminal is not bound to a classroom. Schedules are matched by room, '
+                        . 'so an unbound terminal can never find one. Set the classroom on the device.';
+            out(sprintf('  %-22s %s', 'Classroom', 'NOT SET'), 'red');
+        } else {
+            out(sprintf('  %-22s %s (%s)', 'Classroom', $device['room_number'], $device['building']), 'grey');
+        }
+
+        // --- schedules for this room today ---
+        $today = $db->select(
+            "SELECT sch.schedule_id, sch.day_of_week, sch.start_time, sch.end_time, sch.status,
+                    sch.time_in_window_open, sch.time_out_window_close,
+                    sub.subject_code, sec.section_code,
+                    CONCAT(t.first_name, ' ', t.last_name) AS teacher_name,
+                    t.teacher_id, t.fingerprint_status
+               FROM schedules sch
+               JOIN subjects sub ON sub.subject_id = sch.subject_id
+               JOIN sections sec ON sec.section_id = sch.section_id
+               JOIN teachers t   ON t.teacher_id = sch.teacher_id
+              WHERE sch.classroom_id = :room
+                AND sch.day_of_week = :day
+                AND sch.deleted_at IS NULL
+              ORDER BY sch.start_time",
+            ['room' => $device['classroom_id'], 'day' => $now->format('l')]
+        );
+
+        out(sprintf('  %-22s %d for %s', 'Schedules in this room', count($today), $now->format('l')), 'grey');
+
+        if ($today === [] && $device['classroom_id'] !== null) {
+            $anyDay = (int) $db->scalar(
+                'SELECT COUNT(*) FROM schedules WHERE classroom_id = :room AND deleted_at IS NULL',
+                ['room' => $device['classroom_id']]
+            );
+
+            $blockers[] = $anyDay === 0
+                ? 'No schedule exists for this room at all. Create one in Schedules.'
+                : sprintf('This room has %d schedule(s), but none on a %s. A session can only open '
+                        . 'inside a scheduled class.', $anyDay, $now->format('l'));
+        }
+
+        // ScheduleService is the same code the fingerprint path uses, so an
+        // answer here is the answer the terminal will get.
+        $active = App\Services\ScheduleService::activeForDevice((int) $device['device_row_id'], $now);
+        $activeIds = array_map(static fn (array $s): int => (int) $s['schedule_id'], $active);
+
+        foreach ($today as $schedule) {
+            $isActive = in_array((int) $schedule['schedule_id'], $activeIds, true);
+
+            $opens = $now->setTime(0, 0)->modify($schedule['start_time'])
+                ->modify('-' . (int) $schedule['time_in_window_open'] . ' minutes');
+            $shuts = $now->setTime(0, 0)->modify($schedule['end_time'])
+                ->modify('+' . (int) $schedule['time_out_window_close'] . ' minutes');
+
+            out(sprintf('    %s %s %s  %s-%s  window %s-%s  %s',
+                $isActive ? '>' : ' ',
+                str_pad((string) $schedule['subject_code'], 10),
+                str_pad((string) $schedule['section_code'], 10),
+                substr((string) $schedule['start_time'], 0, 5),
+                substr((string) $schedule['end_time'], 0, 5),
+                $opens->format('H:i'),
+                $shuts->format('H:i'),
+                $isActive ? 'OPEN NOW' : 'not now'
+            ), $isActive ? 'green' : 'grey');
+
+            out(sprintf('        teacher %s, fingerprint %s, schedule %s',
+                $schedule['teacher_name'],
+                $schedule['fingerprint_status'] === 'enrolled' ? 'enrolled' : strtoupper((string) $schedule['fingerprint_status']),
+                $schedule['status']
+            ), 'grey');
+
+            if ($isActive) {
+                if ((string) $schedule['status'] !== 'active') {
+                    $blockers[] = sprintf('The class open right now (%s) is set to "%s", not active.',
+                        $schedule['subject_code'], $schedule['status']);
+                }
+
+                $template = $db->selectOne(
+                    'SELECT sensor_template_id, status FROM fingerprint_templates WHERE teacher_id = :t',
+                    ['t' => (int) $schedule['teacher_id']]
+                );
+
+                if ($template === null) {
+                    $blockers[] = sprintf('%s has no fingerprint enrolled, so nothing they scan can be '
+                                        . 'recognised. Enrol them in Fingerprints.', $schedule['teacher_name']);
+                } else {
+                    out(sprintf('        sensor slot %d (%s)', (int) $template['sensor_template_id'], $template['status']), 'grey');
+
+                    if ((string) $template['status'] !== 'active') {
+                        $blockers[] = sprintf("%s's fingerprint is %s rather than active.",
+                            $schedule['teacher_name'], $template['status']);
+                    }
+                }
+            }
+        }
+
+        if ($active === [] && $today !== []) {
+            $blockers[] = sprintf('A class is scheduled in this room today, but none covers %s. '
+                                . 'Wait for the window, or use time:shift to test.', $now->format('H:i'));
+        }
+
+        // --- verdict ---
+        if ($blockers === []) {
+            ok('Nothing is blocking a session. The assigned teacher scanning now should open one.');
+            out('  If it still refuses, the terminal\'s serial output carries the server\'s reason verbatim.', 'grey');
+        } else {
+            out('');
+            out('  Blocking:', 'red');
+
+            foreach ($blockers as $index => $blocker) {
+                out(sprintf('    %d. %s', $index + 1, $blocker), 'yellow');
+            }
+        }
+    }
+
+    out('');
+}
+
+/**
+ * Write database/lsiams_schema.sql: the complete schema and the reference data
+ * a new installation starts with, as one SQLite script.
+ *
+ * Built from a brand-new database in a temporary file — every migration, then
+ * the reference seeder — never from the live one, so whatever this
+ * installation holds, the file cannot carry a single user account, student,
+ * teacher or attendance record. It documents the schema in one place, and
+ *   sqlite3 storage/database/lsiams.sqlite < database/lsiams_schema.sql
+ * creates a working database from it without PHP.
+ */
+function commandSchemaDump(): void
+{
+    heading('Building a reference-only database');
+
+    $target  = BASE_PATH . '/database/lsiams_schema.sql';
+    $live    = (array) Config::get('database', []);
+    $scratch = BASE_PATH . '/storage/tmp/schema-dump-' . bin2hex(random_bytes(4)) . '.sqlite';
+
+    @mkdir(dirname($scratch), 0775, true);
+
+    // The whole 'database' entry, because that is what Database reads.
+    Config::set('database', ['path' => $scratch] + $live);
+    Database::resetInstance();
+
+    try {
+        if (Database::instance()->path() !== $scratch) {
+            fail('Refusing to continue: the scratch database is not the one open.');
+        }
+
+        commandMigrate();
+        commandSeed([]);
+
+        // The promise in the header, checked rather than assumed: nothing that
+        // belongs to a person may be in this file.
+        foreach (['users', 'students', 'teachers', 'attendance_records', 'audit_logs', 'login_history'] as $table) {
+            if ((int) Database::instance()->scalar('SELECT COUNT(*) FROM ' . $table) !== 0) {
+                fail(sprintf('Refusing to write the file: %s is not empty in the scratch database.', $table));
+            }
+        }
+
+        $body = BackupService::dump($tables);
+    } finally {
+        Database::instance()->disconnect();
+        Database::resetInstance();
+        Config::set('database', $live);
+
+        foreach ([$scratch, $scratch . '-wal', $scratch . '-shm'] as $file) {
+            @unlink($file);
+        }
+    }
+
+    $header = sprintf(<<<'HEADER'
+    -- ===========================================================================
+    -- L-SIAMS — complete schema and reference data (SQLite)
+    --
+    -- Every table, index, view and trigger, plus the reference data the system
+    -- needs to start: roles, permissions, grade levels, departments, subjects,
+    -- the attendance-status vocabulary, the default settings and the current
+    -- school year.
+    --
+    -- Contains NO user accounts and no student, teacher or attendance data.
+    --
+    -- The application builds its database with `php bin/console install`; this
+    -- file is the same result in one script, for reading or for:
+    --   sqlite3 storage/database/lsiams.sqlite < database/lsiams_schema.sql
+    -- Defaults call now(), which the application supplies, so a database made
+    -- this way is for L-SIAMS to use, not for inserting rows by hand.
+    --
+    -- Generated by `php bin/console schema:dump` on %s (%d tables).
+    -- Do not hand-edit — schema changes belong in database/migrations/.
+    -- ===========================================================================
+
+
+    HEADER, Clock::now()->format('Y-m-d'), $tables);
+
+    if (file_put_contents($target, $header . $body) === false) {
+        fail('Could not write ' . $target);
+    }
+
+    out('');
+    ok(sprintf('database/lsiams_schema.sql written (%.1f KB)', filesize($target) / 1024));
+}
+
+/**
+ * Issue the server certificate, creating the school's own root the first time.
+ *
+ * Deliberately reuses an existing root: it is installed on staff laptops and
+ * compiled into terminal firmware, so replacing it means physically visiting
+ * every device. Renewal should cost a command and an Apache restart, and
+ * --new-ca is the only way to pay more than that.
+ */
+function commandTlsGenerate(array $arguments, array $flags): void
+{
+    heading('Issuing the server certificate');
+
+    if (trim((string) Env::get('APP_KEY', '')) === '') {
+        fail(
+            "APP_KEY is not set, and the certificate authority key is stored encrypted under it.\n"
+            . '  Run `console.bat key:generate` first, then run this again.'
+        );
+    }
+
+    $hosts = tlsFlagValues($flags, 'host');
+    $ips   = tlsFlagValues($flags, 'ip');
+    $days  = (int) (tlsFlagValues($flags, 'days')[0] ?? 825);
+    $newCa = in_array('--new-ca', $flags, true);
+
+    // Nothing named: work out what this server actually answers to, rather
+    // than issuing a certificate for a name nobody will ever type.
+    if ($hosts === [] && $ips === []) {
+        [$hosts, $ips] = tlsDiscoverNames();
+
+        out('  No --host or --ip given, so these were worked out from APP_URL and this machine:', 'grey');
+
+        foreach (array_merge($hosts, $ips) as $name) {
+            out('    ' . $name, 'grey');
+        }
+
+        out('  Add --host=name or --ip=address to name others.', 'grey');
+        out('');
+    }
+
+    if ($newCa && TlsCertificateService::caExists()) {
+        out('  --new-ca replaces the root certificate.', 'yellow');
+        out('  Every terminal already flashed with the old root will stop connecting until it is', 'yellow');
+        out('  re-flashed, and every browser that trusted the old root will warn again.', 'yellow');
+        out('');
+
+        if (strtolower(prompt('  Type REPLACE to confirm')) !== 'replace') {
+            fail('Left the existing root in place. Nothing was changed.');
+        }
+    }
+
+    $result = TlsCertificateService::generate($hosts, $ips, $newCa, $days);
+
+    if ($result['ca_created']) {
+        ok('Created the school root certificate, valid until ' . $result['ca_expires']);
+        out('    fingerprint ' . $result['fingerprint'], 'grey');
+    } else {
+        ok('Reused the existing root certificate — flashed terminals keep working');
+    }
+
+    ok('Issued the server certificate, valid until ' . $result['expires']);
+    out('    valid for ' . implode(', ', array_merge($result['hosts'], $result['ips'])), 'grey');
+
+    $paths = $result['paths'];
+
+    heading('What to do next');
+    out('  1. Configure Apache to use it:');
+    out('       console.bat tls:apache', 'cyan');
+    out('');
+    out('  2. Trust the root on every PC and phone that opens the system.');
+    out('     Send them this file — it is public and safe to copy:');
+    out('       ' . $paths['ca_cert'], 'cyan');
+    out('     On Windows: double-click it, Install Certificate, Local Machine,');
+    out('     "Place all certificates in the following store" -> Trusted Root Certification Authorities.');
+    out('');
+    out('  3. Teach the terminals the same root. Copy this file into the sketch folder,');
+    out('     next to L_SIAMS_Bench.ino, then re-flash:');
+    out('       ' . $paths['firmware_header'], 'cyan');
+    out('     Change LS_SERVER_URL to start with https:// at the same time.');
+    out('');
+    // Easy to miss, and its failure is silent: the page loads perfectly and
+    // only the live updates stop, with the reason visible nowhere but the
+    // browser's own console.
+    if (!(bool) Config::get('realtime.tls.enabled', true)) {
+        out('  4. Turn on TLS for the live dashboards. In .env set:');
+        out('       REALTIME_TLS_ENABLED=true', 'cyan');
+        out('     An https page is refused a ws:// socket by every browser, so without this');
+        out('     the dashboards simply stop updating and nothing here reports why.');
+        out('     The certificate just issued is picked up automatically.');
+        out('');
+    }
+
+    out('  Back up ' . $paths['ca_key'] . ' with .env.', 'grey');
+    out('  It is encrypted under APP_KEY: losing APP_KEY means the root cannot sign again,', 'grey');
+    out('  and renewing would then mean re-flashing every terminal.', 'grey');
+}
+
+/**
+ * Write the Apache configuration rather than asking anyone to compose it.
+ *
+ * A hand-written SSL vhost is a reliable way to spend an evening: the paths use
+ * the wrong slashes, DocumentRoot lands on the project root instead of public/
+ * and exposes .env to the network, or the certificate and key are swapped.
+ * Generating the file removes every one of those, and leaves the operator one
+ * line to add to httpd.conf.
+ */
+function commandTlsApache(array $arguments, array $flags): void
+{
+    heading('Apache configuration for HTTPS');
+
+    if (!TlsCertificateService::serverCertificateExists()) {
+        fail(
+            "There is no server certificate yet.\n"
+            . '  Run `console.bat tls:generate` first.'
+        );
+    }
+
+    $port   = (int) (tlsFlagValues($flags, 'port')[0] ?? 443);
+    $names  = TlsCertificateService::subjectAltNames();
+    $paths  = TlsCertificateService::paths();
+    $target = $paths['dir'] . '/lsiams-ssl.conf';
+
+    // Apache reads forward slashes on Windows and chokes on backslashes inside
+    // quoted paths, so every path in the file is normalised on the way out.
+    $slash = static fn (string $path): string => str_replace('\\', '/', $path);
+
+    $documentRoot = $slash(BASE_PATH . '/public');
+    $serverName   = $names[0] ?? 'localhost';
+
+    $aliases = '';
+
+    foreach (array_slice($names, 1) as $alias) {
+        // ServerAlias takes names, not IP addresses; an IP reaches this vhost
+        // by being in the certificate and matching no other ServerName.
+        if (filter_var($alias, FILTER_VALIDATE_IP) === false) {
+            $aliases .= sprintf("    ServerAlias %s\n", $alias);
+        }
+    }
+
+    $config = sprintf(
+        <<<'CONF'
+        # ===========================================================================
+        # L-SIAMS — HTTPS for Apache
+        #
+        # GENERATED FILE. Produced by `console.bat tls:apache`; regenerate rather
+        # than edit, so a later certificate change cannot leave this behind.
+        #
+        # To use it, open
+        #   C:\xampp\apache\conf\httpd.conf
+        # and at the very bottom add this one line:
+        #
+        #   Include "%s"
+        #
+        # Then comment out XAMPP's own SSL config a few lines above, so there is
+        # only one thing listening on %d:
+        #
+        #   #Include conf/extra/httpd-ssl.conf
+        #
+        # Save, then restart Apache from the XAMPP Control Panel.
+        # ===========================================================================
+
+        Listen %d
+
+        <VirtualHost *:%d>
+            ServerName %s
+        %s
+            # public/ only. The project root holds .env, the database backups and
+            # the certificate keys; serving it would publish all three.
+            DocumentRoot "%s"
+
+            SSLEngine on
+            SSLCertificateFile    "%s"
+            SSLCertificateKeyFile "%s"
+
+            # TLS 1.2 is the floor. Everything below it is broken in ways that
+            # have names, and the ESP32 speaks 1.2 perfectly well.
+            SSLProtocol -all +TLSv1.2 +TLSv1.3
+            SSLHonorCipherOrder off
+            SSLSessionTickets off
+
+            <Directory "%s">
+                Options -Indexes +FollowSymLinks
+                AllowOverride All
+                Require all granted
+            </Directory>
+
+            # Uploaded files are data, never code. Repeated here as well as in
+            # public/uploads/.htaccess because a virtual host cannot be turned
+            # off by an AllowOverride change, and turning a file upload into
+            # code execution is not a risk worth leaving to one layer.
+            <Directory "%s/uploads">
+                <FilesMatch "\.(php|phtml|phar|php[0-9]|cgi|pl|py|sh|exe|bat)$">
+                    Require all denied
+                </FilesMatch>
+                Options -Indexes -ExecCGI
+            </Directory>
+
+            ErrorLog  "%s/apache-ssl-error.log"
+            CustomLog "%s/apache-ssl-access.log" combined
+        </VirtualHost>
+
+        # ---------------------------------------------------------------------------
+        # Send plain HTTP to HTTPS.
+        #
+        # Commented out because it takes over port 80 for this machine, which
+        # matters if XAMPP is also serving something else. Uncomment it once the
+        # HTTPS address above is confirmed working.
+        # ---------------------------------------------------------------------------
+        #<VirtualHost *:80>
+        #    ServerName %s
+        #    Redirect permanent / https://%s/
+        #</VirtualHost>
+
+        CONF,
+        $slash($target),
+        $port,
+        $port,
+        $port,
+        $serverName,
+        rtrim($aliases, "\n"),
+        $documentRoot,
+        $slash($paths['server_cert']),
+        $slash($paths['server_key']),
+        $documentRoot,
+        $documentRoot,
+        $slash((string) Config::get('app.paths.logs')),
+        $slash((string) Config::get('app.paths.logs')),
+        $serverName,
+        $serverName . ($port === 443 ? '' : ':' . $port)
+    );
+
+    if (file_put_contents($target, $config) === false) {
+        fail('Could not write ' . $target);
+    }
+
+    ok('Wrote ' . $target);
+    out('');
+    out('  Add this one line to the bottom of C:\\xampp\\apache\\conf\\httpd.conf:');
+    out('      Include "' . $slash($target) . '"', 'cyan');
+    out('');
+    out('  Comment out XAMPP\'s own SSL include in the same file, so only one thing');
+    out('  is listening on ' . $port . ':');
+    out('      #Include conf/extra/httpd-ssl.conf', 'cyan');
+    out('');
+    out('  Restart Apache in the XAMPP Control Panel, then open:');
+    out('      https://' . $serverName . ($port === 443 ? '' : ':' . $port), 'cyan');
+    out('');
+    out('  Finally set APP_URL in .env to that same address, so links and the', 'grey');
+    out('  session cookie agree with what the browser is actually using.', 'grey');
+}
+
+/**
+ * Repeatable `--name=value` flags.
+ *
+ * @return list<string>
+ */
+function tlsFlagValues(array $flags, string $name): array
+{
+    $values = [];
+    $prefix = '--' . $name . '=';
+
+    foreach ($flags as $flag) {
+        if (str_starts_with($flag, $prefix)) {
+            $value = trim(substr($flag, strlen($prefix)));
+
+            if ($value !== '') {
+                $values[] = $value;
+            }
+        }
+    }
+
+    return $values;
+}
+
+/**
+ * Work out the names this server is reachable by.
+ *
+ * APP_URL is the address the administrator already told the system to use, so
+ * it is the one that must be on the certificate. The machine's own LAN address
+ * is added as well, because terminals are configured by IP and a certificate
+ * that omits it fails on the boards while working perfectly in the browser —
+ * a split failure that is genuinely hard to read from either end.
+ *
+ * @return array{0:list<string>,1:list<string>}
+ */
+function tlsDiscoverNames(): array
+{
+    $hosts = [];
+    $ips   = [];
+
+    $appHost = (string) (parse_url((string) Config::get('app.url', ''), PHP_URL_HOST) ?: '');
+
+    if ($appHost !== '') {
+        if (filter_var($appHost, FILTER_VALIDATE_IP) !== false) {
+            $ips[] = $appHost;
+        } else {
+            $hosts[] = $appHost;
+        }
+    }
+
+    $machine = gethostname();
+
+    if (is_string($machine) && $machine !== '') {
+        $hosts[] = strtolower($machine);
+
+        $resolved = gethostbyname($machine);
+
+        if ($resolved !== $machine
+            && filter_var($resolved, FILTER_VALIDATE_IP) !== false
+            && !str_starts_with($resolved, '127.')) {
+            $ips[] = $resolved;
+        }
+    }
+
+    return [array_values(array_unique($hosts)), array_values(array_unique($ips))];
+}
+
+/**
+ * The TLS half of the doctor.
+ *
+ * Split out because it is the section most likely to be read on a bad day: a
+ * certificate that expired overnight takes the whole school offline at once,
+ * every browser and every terminal together, and the symptom people report is
+ * "nothing works" rather than anything about certificates. Every check here
+ * exists to make that a warning weeks earlier instead of a discovery.
+ */
+function doctorTls(string $appUrl, callable $check, callable $warn, callable $note): void
+{
+    $paths     = TlsCertificateService::paths();
+    $isHttps   = str_starts_with(strtolower($appUrl), 'https://');
+    $certified = TlsCertificateService::serverCertificateExists();
+
+    // Checked before anything about certificates, because it is the one
+    // mismatch that locks everybody out and writes nothing anywhere.
+    //
+    // A Secure cookie is never sent over http, and the __Host- prefix the
+    // session picks up alongside it makes the browser refuse to store the
+    // cookie at all. Login then succeeds, redirects, arrives with no cookie,
+    // and returns to the login form — with a correct password, no error on
+    // screen and nothing in any log, because from the server's side nothing
+    // failed. Turning the flag on before the site actually serves https is an
+    // easy ordering mistake and an extremely hard symptom to read.
+    $cookieSecure = (bool) Config::get('security.session.cookie.secure', true);
+
+    if ($cookieSecure && $appUrl !== '' && !$isHttps) {
+        $check(
+            false,
+            'Session cookie matches the scheme',
+            'SESSION_COOKIE_SECURE=true but APP_URL is http:// — nobody can log in; set it false until https works'
+        );
+    } elseif (!$cookieSecure && $isHttps) {
+        $warn(
+            'Session cookie is not marked Secure',
+            'the site is https but SESSION_COOKIE_SECURE=false, so the cookie can leak over http'
+        );
+        $note('Set SESSION_COOKIE_SECURE=true in .env. Everyone is signed out once when you do — the cookie is renamed.');
+    } elseif ($cookieSecure && $isHttps) {
+        $check(true, 'Session cookie matches the scheme', 'Secure, __Host- prefixed');
+    }
+
+    if (!$certified) {
+        if ($isHttps) {
+            $check(false, 'Server certificate', 'APP_URL is https:// but no certificate exists — run tls:generate');
+        } else {
+            $warn('HTTPS is not set up', 'card taps and passwords cross the network in clear text');
+            $note('Run `console.bat tls:generate` to issue a certificate, then `tls:apache`.');
+        }
+
+        return;
+    }
+
+    $state  = TlsCertificateService::inspect();
+    $server = $state['server'];
+    $ca     = $state['ca'];
+
+    if ($server === null) {
+        $check(false, 'Server certificate', 'the file exists but cannot be read as a certificate');
+
+        return;
+    }
+
+    // Expiry. Two thresholds, because the two certificates cost very different
+    // amounts to replace: the server's is a command, the root's is a trip to
+    // every terminal in the building.
+    $days = (int) $server['days_left'];
+
+    if ($days < 0) {
+        $check(false, 'Server certificate validity', sprintf('EXPIRED %d day(s) ago — run tls:generate', -$days));
+    } elseif ($days <= 30) {
+        $warn('Server certificate expires soon', sprintf('%d day(s) left — run tls:generate', $days));
+    } else {
+        $check(true, 'Server certificate validity', sprintf('%d day(s) left (%s)', $days, $server['expires']));
+    }
+
+    if ($ca !== null) {
+        $caDays = (int) $ca['days_left'];
+
+        if ($caDays < 0) {
+            $check(false, 'Root certificate validity', 'EXPIRED — every terminal needs re-flashing after tls:generate --new-ca');
+        } elseif ($caDays <= 180) {
+            $warn('Root certificate expires', sprintf('%d day(s) left — replacing it means re-flashing every terminal', $caDays));
+        } else {
+            $check(true, 'Root certificate validity', sprintf('%d day(s) left (%s)', $caDays, $ca['expires']));
+        }
+    }
+
+    // The root key is only needed to issue, so a broken one is invisible until
+    // renewal day — which is the worst possible day to find out.
+    $readable = TlsCertificateService::caKeyReadable();
+
+    $check(
+        $readable,
+        'Root key readable',
+        $readable
+            ? 'decrypts under the current APP_KEY'
+            : 'cannot be decrypted — APP_KEY differs from the one that created it'
+    );
+
+    // A certificate that does not name the address people type is valid and
+    // useless. This is the check that catches a moved DHCP lease.
+    if ($appUrl !== '') {
+        $coverage = TlsCertificateService::covers($appUrl);
+
+        $check(
+            $coverage['covered'],
+            'Certificate covers APP_URL',
+            $coverage['covered']
+                ? $coverage['name']
+                : sprintf(
+                    '%s is not on the certificate (%s) — reissue with --host or --ip',
+                    $coverage['name'],
+                    implode(', ', $coverage['names'])
+                )
+        );
+    }
+
+    if (!$isHttps) {
+        $warn('APP_URL is still http://', 'a certificate exists but nothing is using it');
+        $note('Set APP_URL to the https:// address once Apache is serving it.');
+    }
+
+    // The realtime server is a second listener on a second port, and switching
+    // the site to https does not switch it. A browser on an https page refuses
+    // a ws:// socket as mixed content and says so only in its own console, so
+    // the symptom reaching anyone is "the dashboard stopped updating" with no
+    // error anywhere in this system at all.
+    if ($isHttps && (bool) Config::get('realtime.enabled', true)) {
+        $realtimeTls = (bool) Config::get('realtime.tls.enabled', true);
+
+        $check(
+            $realtimeTls,
+            'Realtime server uses TLS',
+            $realtimeTls
+                ? 'dashboards connect over wss://'
+                : 'REALTIME_TLS_ENABLED=false, so the page would be told to open ws:// — browsers block that on an https page'
+        );
+
+        if ($realtimeTls) {
+            $cert = (string) Config::get('realtime.tls.cert_file', '');
+            $key  = (string) Config::get('realtime.tls.key_file', '');
+
+            $present = $cert !== '' && $key !== '' && is_file($cert) && is_file($key);
+
+            $check(
+                $present,
+                'Realtime certificate readable',
+                $present ? basename($cert) : $cert . ' not found — the realtime server will not start'
+            );
+        }
+    }
+
+    // Finally, does it actually answer? Everything above reads files; this is
+    // the only check that proves Apache picked them up.
+    if ($isHttps) {
+        doctorTlsHandshake($appUrl, $paths['ca_cert'], $check, $note);
+    }
+}
+
+/**
+ * Open a real TLS connection to the configured address and verify it against
+ * the school's own root — the same judgement a terminal makes.
+ */
+function doctorTlsHandshake(string $appUrl, string $caFile, callable $check, callable $note): void
+{
+    $host = (string) (parse_url($appUrl, PHP_URL_HOST) ?: '');
+    $port = (int) (parse_url($appUrl, PHP_URL_PORT) ?: 443);
+
+    if ($host === '') {
+        return;
+    }
+
+    $context = stream_context_create([
+        'ssl' => [
+            'cafile'            => $caFile,
+            'verify_peer'       => true,
+            'verify_peer_name'  => true,
+            'peer_name'         => $host,
+            'allow_self_signed' => false,
+        ],
+    ]);
+
+    $errno  = 0;
+    $error  = '';
+    $client = @stream_socket_client(
+        sprintf('ssl://%s:%d', $host, $port),
+        $errno,
+        $error,
+        5,
+        STREAM_CLIENT_CONNECT,
+        $context
+    );
+
+    if (is_resource($client)) {
+        fclose($client);
+        $check(true, 'HTTPS answers and validates', sprintf('%s:%d', $host, $port));
+
+        return;
+    }
+
+    $check(false, 'HTTPS answers and validates', trim($error) !== '' ? trim($error) : 'connection failed');
+    $note('Apache may not have been restarted, or may not be including the config from tls:apache.');
+}
+
+/**
+ * Return every card held by a student who has left to the stock pool.
+ *
+ *   console.bat rfid:release
+ *
+ * The case this exists for: a school that ran a term on demo records, archived
+ * them, and now has a drawer of physical cards the system will not re-issue.
+ * assign() refuses any UID already carrying another student's id, and archiving
+ * a student deactivates their card without clearing that id — so without this
+ * the only routes out are a hundred clicks or buying new plastic.
+ *
+ * Only cards whose holder is no longer active are touched. A card belonging to
+ * an enrolled pupil is withdrawn through the replacement flow, which makes a
+ * reason compulsory; this must not become a way round that.
+ *
+ * @param list<string> $flags
+ */
+function commandRfidRelease(array $flags): void
+{
+    heading('Release cards back to stock');
+
+    $cards   = App\Services\RfidService::releasable();
+    $adminId = (int) Database::instance()->scalar(
+        "SELECT u.user_id FROM users u JOIN roles r ON r.role_id = u.role_id
+          WHERE r.role_slug = 'administrator' AND u.deleted_at IS NULL ORDER BY u.user_id LIMIT 1"
+    );
+
+    if ($cards === []) {
+        ok('No cards are held by students who have left. Nothing to release.');
+        out('');
+
+        return;
+    }
+
+    out(sprintf('  %d card(s) are still registered to students who have left:', count($cards)), 'grey');
+    out('');
+
+    foreach (array_slice($cards, 0, 15) as $card) {
+        out(sprintf(
+            '    %-12s %-10s %s %s (%s)',
+            $card['card_uid'],
+            $card['status'],
+            $card['first_name'],
+            $card['last_name'],
+            $card['student_number']
+        ));
+    }
+
+    if (count($cards) > 15) {
+        out(sprintf('    ... and %d more', count($cards) - 15), 'grey');
+    }
+
+    out('');
+    out('  Releasing does not touch attendance. Every tap these cards made keeps the', 'grey');
+    out('  student who made it and the UID it was made with — only the registry changes.', 'grey');
+
+    if (!in_array('--yes', $flags, true)
+        && strtolower(prompt('  Release all ' . count($cards) . ' card(s)? (yes/no)')) !== 'yes') {
+        out('');
+        out('  Nothing was released.', 'grey');
+        out('');
+
+        return;
+    }
+
+    $released = 0;
+    $failed   = [];
+
+    foreach ($cards as $card) {
+        try {
+            App\Services\RfidService::release((int) $card['rfid_id'], $adminId, 'Bulk release: previous holder has left.');
+            $released++;
+        } catch (Throwable $e) {
+            $failed[] = $card['card_uid'] . ': ' . $e->getMessage();
+        }
+    }
+
+    out('');
+    ok(sprintf('%d card(s) returned to stock.', $released));
+
+    foreach ($failed as $line) {
+        out('  ✗ ' . $line, 'red');
+    }
+
+    out('');
+    out('  These UIDs can now be assigned to anybody from Admin -> RFID Cards.', 'cyan');
+    out('');
+}
+
+/**
+ * Enrol sample students into a section, so there is a class to tap cards for.
+ *
+ *   console.bat students:sample                          every active section, 10 each
+ *   console.bat students:sample --section=G3-S1          one section
+ *   console.bat students:sample --section=G3-S1 --section=G3-S2 --count=10
+ *
+ * A section with no students is not testable: no roster, no attendance rate,
+ * nothing for a card to belong to. This fills that gap without hand-typing
+ * thirty forms, and stops short of the part that has to be real — no RFID card
+ * is issued, because a card UID has to come off an actual card at an actual
+ * reader. Register those from Admin -> RFID Cards afterwards.
+ *
+ * Everything goes through StudentService::create(), so the capacity trigger,
+ * the grade-level check, the enrolment history row and the audit entry all
+ * happen exactly as they would if each student were typed into the form.
+ *
+ * Idempotent by count rather than by name: a section that already holds the
+ * requested number of active students is left alone, so running this twice
+ * does not produce twenty. Student numbers continue from whatever the school
+ * already uses rather than restarting, so these cannot collide with real ones.
+ *
+ * @param list<string> $flags
+ */
+function commandSampleStudents(array $flags): void
+{
+    $db     = Database::instance();
+    $codes  = [];
+    $count  = 10;
+
+    foreach ($flags as $flag) {
+        if (str_starts_with($flag, '--section=')) {
+            $codes[] = substr($flag, 10);
+        }
+        if (str_starts_with($flag, '--count=')) {
+            $count = max(1, min(45, (int) substr($flag, 8)));
+        }
+    }
+
+    heading('Sample students');
+
+    // Named sections, or every active one. Archived sections are never
+    // included: enrolling into a section somebody has retired is not a thing
+    // anybody means to do.
+    if ($codes === []) {
+        $sections = $db->select(
+            "SELECT sec.section_id, sec.section_code, sec.section_name, sec.grade_level_id,
+                    sec.capacity, gl.numeric_level, gl.grade_level_name
+               FROM sections sec
+               JOIN grade_levels gl ON gl.grade_level_id = sec.grade_level_id
+              WHERE sec.status = 'active' AND sec.deleted_at IS NULL
+              ORDER BY gl.numeric_level, sec.section_code"
+        );
+    } else {
+        $placeholders = [];
+        $bindings     = [];
+
+        foreach (array_values($codes) as $i => $code) {
+            $placeholders[]      = ':c' . $i;
+            $bindings['c' . $i]  = $code;
+        }
+
+        $sections = $db->select(
+            "SELECT sec.section_id, sec.section_code, sec.section_name, sec.grade_level_id,
+                    sec.capacity, gl.numeric_level, gl.grade_level_name
+               FROM sections sec
+               JOIN grade_levels gl ON gl.grade_level_id = sec.grade_level_id
+              WHERE sec.section_code IN (" . implode(',', $placeholders) . ")
+                AND sec.deleted_at IS NULL
+              ORDER BY gl.numeric_level, sec.section_code",
+            $bindings
+        );
+
+        $found   = array_column($sections, 'section_code');
+        $missing = array_diff($codes, $found);
+
+        if ($missing !== []) {
+            fail('No such section: ' . implode(', ', $missing) . '. Check the code on Admin -> Sections.');
+        }
+    }
+
+    if ($sections === []) {
+        fail('There are no active sections to enrol into. Create a section first.');
+    }
+
+    $adminId = (int) $db->scalar(
+        "SELECT u.user_id FROM users u JOIN roles r ON r.role_id = u.role_id
+          WHERE r.role_slug = 'administrator' AND u.deleted_at IS NULL
+          ORDER BY u.user_id LIMIT 1"
+    );
+
+    if ($adminId === 0) {
+        fail('No administrator account exists to record the enrolment against. Run user:create-admin first.');
+    }
+
+    // ------------------------------------------------------------- planning --
+    $plan = [];
+
+    foreach ($sections as $section) {
+        $existing = (int) $db->scalar(
+            "SELECT COUNT(*) FROM students
+              WHERE section_id = :s AND status = 'active' AND deleted_at IS NULL",
+            ['s' => (int) $section['section_id']]
+        );
+
+        $wanted = max(0, $count - $existing);
+
+        if ($existing + $wanted > (int) $section['capacity']) {
+            $wanted = max(0, (int) $section['capacity'] - $existing);
+        }
+
+        $plan[] = $section + ['existing' => $existing, 'wanted' => $wanted];
+    }
+
+    foreach ($plan as $row) {
+        out(sprintf(
+            '    %-12s %-22s %2d enrolled  ->  %s',
+            $row['section_code'],
+            $row['grade_level_name'],
+            $row['existing'],
+            $row['wanted'] === 0 ? 'nothing to add' : sprintf('add %d', $row['wanted'])
+        ), $row['wanted'] === 0 ? 'grey' : '');
+    }
+
+    $total = array_sum(array_column($plan, 'wanted'));
+
+    out('');
+
+    if ($total === 0) {
+        ok('Every section already has ' . $count . ' or more students. Nothing to do.');
+        out('');
+
+        return;
+    }
+
+    if (!in_array('--yes', $flags, true)) {
+        out('  These are sample records, not real enrolments. They can be archived', 'yellow');
+        out('  from Admin -> Students, but never deleted — attendance is permanent.', 'yellow');
+
+        if (strtolower(prompt('  Enrol ' . $total . ' sample student(s)? (yes/no)')) !== 'yes') {
+            out('');
+            out('  Nothing was created.', 'grey');
+            out('');
+
+            return;
+        }
+    }
+
+    // -------------------------------------------------------------- the data --
+    // Two pools rather than one, so a section is not all boys. Surnames are
+    // common Filipino ones; nothing here is taken from a real roll.
+    $male = [
+        'Angelo Rafael', 'Kian Dwight', 'Miguel Andres', 'Joshua Emmanuel', 'Nathaniel Cruz',
+        'Paulo Sebastian', 'Rafael Luis', 'Ivan Gabriel', 'Marcus Elias', 'Dominic Jose',
+        'Lorenzo Miguel', 'Enzo Matteo', 'Zach Tristan', 'Aaron Kyle', 'Julian Reyes',
+    ];
+    $female = [
+        'Kyla Marie', 'Sofia Isabelle', 'Andrea Nicole', 'Bea Katrina', 'Trisha Mae',
+        'Althea Jane', 'Camille Louise', 'Danica Rose', 'Erika Faith', 'Maria Clara',
+        'Hannah Grace', 'Yvonne Patrice', 'Jasmine Reigh', 'Nicole Anne', 'Precious Joy',
+    ];
+    $surnames = [
+        'Dela Peña', 'Ocampo', 'Villanueva', 'Bautista', 'Mercado', 'Salazar', 'Fernandez',
+        'Aquino', 'Del Rosario', 'Gonzales', 'Navarro', 'Pascual', 'Rivera', 'Tolentino',
+        'Espiritu', 'Alcantara', 'Bernardo', 'Castillo', 'Domingo', 'Enriquez',
+    ];
+    $middles = [
+        'Santos', 'Reyes', 'Cruz', 'Garcia', 'Ramos', 'Mendoza', 'Torres', 'Flores',
+        'Manalo', 'Lim', 'Bacani', 'Ignacio', 'Padilla', 'Soriano', 'Velasco',
+    ];
+    $guardians = [
+        'Marissa', 'Ronaldo', 'Cristina', 'Eduardo', 'Lorna', 'Ferdinand', 'Editha',
+        'Rogelio', 'Teresita', 'Alfredo', 'Imelda', 'Bernardo', 'Corazon', 'Danilo',
+    ];
+
+    // Continue the school's own numbering rather than starting a parallel one,
+    // so a sample record cannot collide with a real student issued later.
+    $year   = SchoolYearService::current();
+    $prefix = $year === null
+        ? Clock::now()->format('y')
+        : date('y', (int) strtotime((string) $year['start_date']));
+
+    $highest = (int) $db->scalar(
+        // The text after the last '-': rtrim() strips every character that is
+        // not a dash from the end, which leaves the number up to that dash.
+        "SELECT COALESCE(MAX(CAST(substr(student_number,
+                    length(rtrim(student_number, replace(student_number, '-', ''))) + 1) AS INTEGER)), 0)
+           FROM students WHERE student_number LIKE :p",
+        ['p' => $prefix . '-%']
+    );
+
+    $created = 0;
+    $failed  = [];
+    $pick    = 0;
+
+    foreach ($plan as $section) {
+        if ($section['wanted'] === 0) {
+            continue;
+        }
+
+        // Roughly the age a pupil is in that grade: six at Grade 1, and one
+        // more per grade after that. Birthdays are spread across the year so a
+        // report grouped by month is not one bar.
+        $age = 6 + max(1, (int) $section['numeric_level']);
+
+        for ($i = 0; $i < $section['wanted']; $i++, $pick++) {
+            $isMale = $pick % 2 === 0;
+            $first  = $isMale ? $male[$pick % count($male)] : $female[$pick % count($female)];
+            $last   = $surnames[$pick % count($surnames)];
+
+            $birthYear  = (int) Clock::now()->format('Y') - $age;
+            $birthMonth = ($pick % 12) + 1;
+            $birthDay   = (($pick * 7) % 27) + 1;
+
+            $number  = $prefix . '-' . str_pad((string) (++$highest), 4, '0', STR_PAD_LEFT);
+            $guardian = $guardians[$pick % count($guardians)] . ' ' . $last;
+
+            try {
+                StudentService::create([
+                    'student_number'   => $number,
+                    'section_id'       => (int) $section['section_id'],
+                    'grade_level_id'   => (int) $section['grade_level_id'],
+                    'first_name'       => $first,
+                    'middle_name'      => $middles[$pick % count($middles)],
+                    'last_name'        => $last,
+                    'gender'           => $isMale ? 'Male' : 'Female',
+                    'birthdate'        => sprintf('%04d-%02d-%02d', $birthYear, $birthMonth, $birthDay),
+                    // Left empty on purpose. An invented address is a plausible
+                    // real one, and an invented email is somebody's real inbox.
+                    'email'            => null,
+                    'address'          => null,
+                    'guardian_name'    => $guardian,
+                    // Clearly sequential, so nobody mistakes it for a number
+                    // that can be rung.
+                    'guardian_contact' => '0917' . str_pad((string) (1230000 + $pick), 7, '0', STR_PAD_LEFT),
+                    'guardian_email'   => null,
+                    'status'           => 'active',
+                    'enrolled_at'      => Clock::today(),
+                ], $adminId);
+
+                $created++;
+            } catch (Throwable $e) {
+                $failed[] = $number . ' (' . $section['section_code'] . '): ' . $e->getMessage();
+                $highest--;   // the number was never used, so do not burn it
+            }
+        }
+    }
+
+    out('');
+    ok(sprintf('%d student(s) enrolled.', $created));
+
+    foreach ($failed as $message) {
+        out('  ✗ ' . $message, 'red');
+    }
+
+    out('');
+    out('  No RFID cards were issued — a card UID has to come off a real card at a', 'cyan');
+    out('  real reader. Assign them from Admin -> RFID Cards, or tap an unknown card', 'cyan');
+    out('  on a terminal and register it from the prompt that appears.', 'cyan');
+    out('');
+}
+
+/**
+ * Erase every fingerprint enrolment and ask every terminal to empty its sensor.
+ *
+ * A bring-up tool, not an everyday one, which is why it lives here and not
+ * behind a button. Wiping one sensor is a normal repair and the Fingerprints
+ * page offers it; wiping the lot is starting over, and starting over should
+ * take a deliberate command and a typed confirmation rather than a stray click
+ * on a page an administrator visits for ordinary work.
+ *
+ * What it does, in the order that matters:
+ *
+ *   1. Queues a sensor wipe on every live terminal. The terminals carry it out
+ *      on their next poll — the server cannot reach into their flash.
+ *   2. Drops every slot record, because those describe flash that is about to
+ *      be empty.
+ *   3. Deletes every enrolment, so no teacher is left listed as enrolled with
+ *      nothing behind it.
+ *
+ * fingerprint_logs are left alone. They are the record that the enrolments and
+ * verifications happened, and a reset is not a reason to lose the history of
+ * what the system did before it.
+ *
+ * @param list<string> $flags
+ */
+function commandFingerprintReset(array $flags): void
+{
+    $db = Database::instance();
+
+    heading('Reset every fingerprint enrolment');
+
+    $enrolments = (int) $db->scalar('SELECT COUNT(*) FROM fingerprint_templates');
+    $slots      = (int) $db->scalar('SELECT COUNT(*) FROM fingerprint_slots');
+
+    $terminals = $db->select(
+        "SELECT d.id, d.device_id, d.sensor_template_count, c.room_number
+           FROM devices d
+      LEFT JOIN classrooms c ON c.classroom_id = d.classroom_id
+          WHERE d.deleted_at IS NULL
+            AND d.status NOT IN ('decommissioned','disabled')
+          ORDER BY d.device_id"
+    );
+
+    out(sprintf('  %-26s %d', 'Enrolments to delete', $enrolments), 'grey');
+    out(sprintf('  %-26s %d', 'Slot records to drop', $slots), 'grey');
+    out(sprintf('  %-26s %d', 'Terminals to wipe', count($terminals)), 'grey');
+    out('');
+
+    foreach ($terminals as $terminal) {
+        out(sprintf(
+            '    %-18s %-10s sensor reports %s template(s)',
+            (string) $terminal['device_id'],
+            // ASCII, because %-10s pads by bytes and an em dash is three of
+            // them — the column silently loses two spaces on every such row.
+            $terminal['room_number'] === null ? '-' : 'Room ' . $terminal['room_number'],
+            $terminal['sensor_template_count'] === null ? '?' : (string) $terminal['sensor_template_count']
+        ), 'grey');
+    }
+
+    if ($enrolments === 0 && $slots === 0) {
+        out('');
+        out('  There are no enrolments to erase. The sensors will still be wiped.', 'cyan');
+    }
+
+    out('');
+    out('  Every teacher will have to be enrolled again, in person.', 'yellow');
+    out('  Each terminal erases its sensor on its next poll — leave them powered on.', 'grey');
+    out('  Verification history in fingerprint_logs is kept.', 'grey');
+
+    if (!in_array('--force', $flags, true)) {
+        out('');
+        out('  Dry run — nothing has been changed.', 'cyan');
+        out('  Re-run with --force to carry it out:', 'grey');
+        out('    php bin/console fingerprint:reset --force', 'grey');
+        out('');
+
+        return;
+    }
+
+    out('');
+    $typed = prompt('  Type RESET to confirm');
+
+    if (!hash_equals('RESET', $typed)) {
+        fail('Confirmation did not match. Nothing was changed.');
+    }
+
+    // Queued before the records go: requestSensorWipe() counts what would be
+    // lost, and once the enrolments are deleted there is nothing left to count.
+    // The wipe is what the terminals act on, so it has to be recorded even
+    // though the server-side rows are about to vanish.
+    $queued = 0;
+
+    foreach ($terminals as $terminal) {
+        $db->update('devices', [
+            'sensor_wipe_requested_at' => App\Core\Clock::nowString(),
+            'sensor_wipe_requested_by' => null,
+            'updated_at'               => App\Core\Clock::nowString(),
+        ], ['id' => (int) $terminal['id']]);
+
+        $queued++;
+    }
+
+    $db->execute('DELETE FROM fingerprint_slots');
+    $db->execute('DELETE FROM fingerprint_templates');
+    $db->execute("UPDATE teachers SET fingerprint_status = 'not_enrolled' WHERE deleted_at IS NULL");
+
+    App\Services\AuditService::log(
+        'fingerprint.reset',
+        'fingerprints',
+        'system',
+        null,
+        ['enrolments' => $enrolments, 'slots' => $slots],
+        ['terminals_queued' => $queued],
+        sprintf('Every fingerprint enrolment erased and %d terminal(s) queued for a sensor wipe.', $queued)
+    );
+
+    out('');
+    out(sprintf('  %d enrolment(s) and %d slot record(s) deleted.', $enrolments, $slots), 'green');
+    out(sprintf('  %d terminal(s) will erase their sensors on the next poll.', $queued), 'green');
+    out('');
+    out('  Watch each terminal\'s serial for "erased — 0 template(s) on this sensor now",', 'grey');
+    out('  then enrol the teachers again from Admin -> Fingerprints.', 'grey');
+    out('');
+}
+
+/**
+ * Give a second section the same week as an existing one, rotated so that no
+ * teacher is in two rooms at once.
+ *
+ *   console.bat schedule:mirror --from=G3-S1 --to=G3-S2 --room=102
+ *   console.bat schedule:mirror --from=G3-S1 --to=G3-S2 --room=102 --rotate=2
+ *
+ * Two sections taught by the same seven people cannot simply share a timetable:
+ * copying it verbatim puts every teacher in two classrooms at eight o'clock.
+ * Shifting the whole day later would work and would also mean the second
+ * section finishes at twenty past four, which is not a school day anyone wants
+ * for eight-year-olds.
+ *
+ * So the times stay exactly as they are — same start, same breaks, same lunch,
+ * same finish — and the subjects rotate between the slots. Everyone teaches the
+ * same lessons for the same minutes; they just teach them in a different order.
+ *
+ * The rotation happens within groups of equal duration, which is what keeps a
+ * forty-five minute lesson out of the fifteen-minute Homeroom Guidance slot. A
+ * duration that appears only once cannot rotate — there is nothing to swap it
+ * with — so that period is moved instead, to the first free time after the one
+ * before it. In the Grade 3 week that puts Homeroom Guidance at the top of
+ * lunch rather than in the middle of it, which is where the other section's
+ * already is.
+ *
+ * Everything goes through ScheduleService::create(), so the seventeen
+ * validation rules run exactly as they would if each row were typed into the
+ * form. Nothing here trusts the arithmetic above: if a rotation still collides,
+ * the validator says so and that period is reported rather than written.
+ *
+ * @param list<string> $flags
+ */
+function commandScheduleMirror(array $flags): void
+{
+    $db     = Database::instance();
+    $from   = '';
+    $to     = '';
+    $room   = '';
+    $rotate = 3;
+
+    foreach ($flags as $flag) {
+        if (str_starts_with($flag, '--from='))   { $from   = substr($flag, 7); }
+        if (str_starts_with($flag, '--to='))     { $to     = substr($flag, 5); }
+        if (str_starts_with($flag, '--room='))   { $room   = substr($flag, 7); }
+        if (str_starts_with($flag, '--rotate=')) { $rotate = max(1, (int) substr($flag, 9)); }
+    }
+
+    heading('Mirror a section\'s week');
+
+    if ($from === '' || $to === '') {
+        fail('Give both sections: schedule:mirror --from=G3-S1 --to=G3-S2 --room=102');
+    }
+
+    $section = static function (string $code) use ($db): array {
+        // Accepted by code or by name, because "Diamond" is what the school
+        // calls it and G3-S2 is what the database does.
+        $row = $db->selectOne(
+            'SELECT section_id, section_code, section_name, grade_level_id
+               FROM sections
+              WHERE (section_code = :c OR section_name LIKE :n)
+                AND status = \'active\' AND deleted_at IS NULL
+              ORDER BY section_code LIMIT 1',
+            ['c' => $code, 'n' => '%' . $code . '%']
+        );
+
+        if ($row === null) {
+            fail(sprintf('No active section matching "%s". Check Admin -> Sections.', $code));
+        }
+
+        return $row;
+    };
+
+    $source = $section($from);
+    $target = $section($to);
+
+    if ((int) $source['section_id'] === (int) $target['section_id']) {
+        fail('--from and --to resolved to the same section.');
+    }
+
+    $sourceRows = ScheduleService::forSection((int) $source['section_id']);
+
+    if ($sourceRows === []) {
+        fail(sprintf('%s has no schedule to copy.', $source['section_code']));
+    }
+
+    // The room. Defaulting to the target's own is right far more often than
+    // defaulting to the source's, which would put both sections in one room.
+    if ($room === '') {
+        $room = (string) $db->scalar(
+            'SELECT c.room_number FROM sections s
+               JOIN classrooms c ON c.classroom_id = s.default_classroom_id
+              WHERE s.section_id = :s',
+            ['s' => (int) $target['section_id']]
+        );
+    }
+
+    if ($room === '') {
+        fail('No room given and the target section has no default classroom. Pass --room=102.');
+    }
+
+    $classroom = $db->selectOne(
+        'SELECT classroom_id, room_number FROM classrooms WHERE room_number = :r AND deleted_at IS NULL',
+        ['r' => $room]
+    );
+
+    if ($classroom === null) {
+        fail(sprintf('No classroom "%s".', $room));
+    }
+
+    $adminId = (int) $db->scalar(
+        "SELECT u.user_id FROM users u JOIN roles r ON r.role_id = u.role_id
+          WHERE r.role_slug = 'administrator' AND u.deleted_at IS NULL ORDER BY u.user_id LIMIT 1"
+    );
+
+    out(sprintf('  From   %s (%s)', $source['section_code'], $source['section_name']), 'grey');
+    out(sprintf('  To     %s (%s)', $target['section_code'], $target['section_name']), 'grey');
+    out(sprintf('  Room   %s', $classroom['room_number']), 'grey');
+    out('');
+
+    // --------------------------------------------------------------- slots --
+    // One entry per distinct time slot, carrying whatever is taught in it and
+    // on which days. A slot is the unit that rotates; the days ride along with
+    // the subject, so Reading stays Monday/Wednesday/Friday and Computer stays
+    // Tuesday/Thursday wherever the pair lands.
+    $slots = [];
+
+    foreach ($sourceRows as $row) {
+        $start = substr((string) $row['start_time'], 0, 5);
+        $end   = substr((string) $row['end_time'], 0, 5);
+        $key   = $start . '|' . $end;
+
+        $slots[$key]['start']    = $start;
+        $slots[$key]['end']      = $end;
+        $slots[$key]['duration'] = (int) round((strtotime($end) - strtotime($start)) / 60);
+        $slots[$key]['lessons'][(int) $row['subject_id'] . ':' . (int) $row['teacher_id']]['subject_id'] = (int) $row['subject_id'];
+        $slots[$key]['lessons'][(int) $row['subject_id'] . ':' . (int) $row['teacher_id']]['teacher_id'] = (int) $row['teacher_id'];
+        $slots[$key]['lessons'][(int) $row['subject_id'] . ':' . (int) $row['teacher_id']]['code']       = (string) $row['subject_code'];
+        $slots[$key]['lessons'][(int) $row['subject_id'] . ':' . (int) $row['teacher_id']]['days'][]     = (string) $row['day_of_week'];
+        $slots[$key]['lessons'][(int) $row['subject_id'] . ':' . (int) $row['teacher_id']]['windows']    = [
+            'in_open'   => (int) $row['time_in_window_open'],
+            'in_close'  => (int) $row['time_in_window_close'],
+            'late'      => (int) $row['late_threshold_minutes'],
+            'out_open'  => (int) $row['time_out_window_open'],
+            'out_close' => (int) $row['time_out_window_close'],
+            'dwell'     => (int) $row['minimum_dwell_minutes'],
+        ];
+    }
+
+    ksort($slots);
+    $slots = array_values($slots);
+
+    // ------------------------------------------------------------ rotation --
+    // Grouped by duration so a forty-five minute lesson can only land in a
+    // forty-five minute slot.
+    $byDuration = [];
+
+    foreach ($slots as $i => $slot) {
+        $byDuration[$slot['duration']][] = $i;
+    }
+
+    $assigned = [];
+    $orphans  = [];
+
+    foreach ($byDuration as $duration => $indexes) {
+        $size = count($indexes);
+
+        if ($size < 2) {
+            // Nothing to swap with. Its content stays put for now and the slot
+            // itself is moved below.
+            $orphans[] = $indexes[0];
+            $assigned[$indexes[0]] = $slots[$indexes[0]]['lessons'];
+            continue;
+        }
+
+        foreach ($indexes as $position => $index) {
+            $source = $indexes[($position + $rotate) % $size];
+            $assigned[$index] = $slots[$source]['lessons'];
+        }
+    }
+
+    // A slot whose duration was unique keeps its lessons, so its time has to
+    // change instead: it goes immediately after the period before it, which in
+    // a school day means the front of the break that follows that period.
+    $moved = [];
+
+    foreach ($orphans as $index) {
+        if ($index === 0) {
+            continue;   // nothing before it to sit behind
+        }
+
+        $previousEnd = $slots[$index - 1]['end'];
+        $newStart    = $previousEnd;
+        $newEnd      = date('H:i', strtotime($newStart) + $slots[$index]['duration'] * 60);
+
+        // Only if it actually fits before whatever comes next.
+        if (isset($slots[$index + 1]) && $newEnd > $slots[$index + 1]['start']) {
+            continue;
+        }
+
+        $moved[$index] = [$slots[$index]['start'] . '–' . $slots[$index]['end'], $newStart . '–' . $newEnd];
+
+        $slots[$index]['start'] = $newStart;
+        $slots[$index]['end']   = $newEnd;
+    }
+
+    // ------------------------------------------------------------- preview --
+    out('  New order:', 'cyan');
+
+    foreach ($slots as $index => $slot) {
+        $codes = implode(' / ', array_map(static fn (array $l): string => $l['code'], $assigned[$index]));
+        $note  = isset($moved[$index]) ? '   (moved from ' . $moved[$index][0] . ')' : '';
+
+        out(sprintf('    %s–%s  %-3d  %s%s', $slot['start'], $slot['end'], $slot['duration'], $codes, $note));
+    }
+
+    out('');
+
+    if (!in_array('--yes', $flags, true)
+        && strtolower(prompt('  Create this week for ' . $target['section_code'] . '? (yes/no)')) !== 'yes') {
+        out('');
+        out('  Nothing was created.', 'grey');
+        out('');
+
+        return;
+    }
+
+    // ------------------------------------------------------------- writing --
+    $added   = 0;
+    $skipped = 0;
+    $failed  = [];
+
+    foreach ($slots as $index => $slot) {
+        foreach ($assigned[$index] as $lesson) {
+            foreach ($lesson['days'] as $day) {
+                $duplicate = (int) $db->scalar(
+                    "SELECT COUNT(*) FROM schedules
+                      WHERE section_id = :s AND day_of_week = :d AND start_time = :t
+                        AND status = 'active' AND deleted_at IS NULL",
+                    ['s' => (int) $target['section_id'], 'd' => $day, 't' => $slot['start'] . ':00']
+                );
+
+                if ($duplicate > 0) {
+                    $skipped++;
+                    continue;
+                }
+
+                try {
+                    ScheduleService::create([
+                        'teacher_id'   => $lesson['teacher_id'],
+                        'subject_id'   => $lesson['subject_id'],
+                        'section_id'   => (int) $target['section_id'],
+                        'classroom_id' => (int) $classroom['classroom_id'],
+                        'day_of_week'  => $day,
+                        'start_time'   => $slot['start'],
+                        'end_time'     => $slot['end'],
+                        'time_in_window_open'    => $lesson['windows']['in_open'],
+                        'time_in_window_close'   => $lesson['windows']['in_close'],
+                        'late_threshold_minutes' => $lesson['windows']['late'],
+                        'time_out_window_open'   => $lesson['windows']['out_open'],
+                        'time_out_window_close'  => $lesson['windows']['out_close'],
+                        'minimum_dwell_minutes'  => $lesson['windows']['dwell'],
+                    ], $adminId, true);
+
+                    $added++;
+                } catch (Throwable $e) {
+                    $failed[] = sprintf('%s %s %s: %s', $day, $slot['start'], $lesson['code'], $e->getMessage());
+                }
+            }
+        }
+    }
+
+    out('');
+    out(sprintf('  %d period(s) created, %d already there.', $added, $skipped), $added > 0 ? 'green' : 'grey');
+
+    if ($failed !== []) {
+        out('');
+        out('  These were refused — the validator found a clash the rotation did not:', 'yellow');
+
+        foreach ($failed as $line) {
+            out('    ' . $line, 'grey');
+        }
+
+        out('');
+        out('  Try a different --rotate, or place these few by hand from Admin -> Schedules.', 'grey');
+    }
+
+    out('');
+    $failed === [] ? ok('Timetable built.') : fail(sprintf('%d period(s) refused - see above.', count($failed)));
+}
+
+/**
+ * Build the Grade 3 - Gold timetable from the school's printed class schedule.
+ *
+ *   console.bat schedule:grade3 --room=101
+ *
+ * Written as a command rather than a migration because a timetable is not
+ * schema: it belongs to one section in one school year, the room is a decision
+ * only the school can make, and it should be re-runnable while they are still
+ * settling it. Everything goes through ScheduleService::create(), so the
+ * conflict rules, the window validation and the teacher-assignment sync all
+ * apply exactly as they would if each row were typed into the form.
+ *
+ * Idempotent: a period that already exists for this section, day and time is
+ * left alone, so running it twice adds nothing and running it after hand-edits
+ * does not undo them.
+ *
+ * What is deliberately NOT created: the 7:45 Before Class Activity, the two
+ * break times, lunch and home time. None has a teacher against it on the
+ * printed schedule, and a session opens on a teacher's fingerprint — a period
+ * nobody teaches cannot open one. The 12:45 slot is HGP on Monday, Wednesday
+ * and Friday, which IS taught and is created; on Tuesday and Thursday it is
+ * BCA, which is not.
+ */
+function commandScheduleGradeThree(array $flags): void
+{
+    $db   = Database::instance();
+    $room = '101';
+    $code = 'G3-S1';
+
+    foreach ($flags as $flag) {
+        if (str_starts_with($flag, '--room=')) {
+            $room = substr($flag, 7);
+        }
+        if (str_starts_with($flag, '--section=')) {
+            $code = substr($flag, 10);
+        }
+    }
+
+    heading('Grade 3 - Gold timetable');
+
+    $section = $db->selectOne(
+        'SELECT section_id, section_code, section_name, grade_level_id
+           FROM sections WHERE section_code = :c AND deleted_at IS NULL',
+        ['c' => $code]
+    );
+
+    if ($section === null) {
+        fail(sprintf('No section "%s". Create it first, or pass --section=<code>.', $code));
+    }
+
+    $classroom = $db->selectOne(
+        'SELECT classroom_id, room_number FROM classrooms WHERE room_number = :r AND deleted_at IS NULL',
+        ['r' => $room]
+    );
+
+    if ($classroom === null) {
+        fail(sprintf('No classroom "%s". Pass --room=<number>.', $room));
+    }
+
+    $adminId = (int) $db->scalar(
+        "SELECT u.user_id FROM users u JOIN roles r ON r.role_id = u.role_id
+          WHERE r.role_name = 'administrator' AND u.deleted_at IS NULL ORDER BY u.user_id LIMIT 1"
+    );
+
+    out(sprintf('  Section  %s (%s)', $section['section_code'], $section['section_name']), 'grey');
+    out(sprintf('  Room     %s', $classroom['room_number']), 'grey');
+    out('');
+
+    // ---------------------------------------------------------------- staff --
+    // Department follows the subject each one teaches. Ms. Crizel takes both
+    // Reading and Computer, which sit in different departments; she is placed
+    // in English, the heavier half of her load, and Computer becomes a
+    // cross-department assignment that ScheduleService records as an exception.
+    $staff = [
+        'Ericka'  => ['Venida',    'ESP'],
+        'Alyssa'  => ['Bautista',  'ENG'],
+        'Darwin'  => ['Manalo',    'MATH'],
+        'Crizel'  => ['Domingo',   'ENG'],
+        'Jezza'   => ['Ramos',     'FIL'],
+        'Liemer'  => ['Aguinaldo', 'SCI'],
+        'Khaycee' => ['Salvador',  'AP'],
+    ];
+
+    // Declared here because the secondary-department pass below reads it, and
+    // it is the same list the week is built from further down.
+    $mwf = ['Monday', 'Wednesday', 'Friday'];
+    $tth = ['Tuesday', 'Thursday'];
+    $all = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+
+    $periods = [
+        ['VAL',  'Ericka',  '08:00', '08:45', $all],
+        ['ENG',  'Alyssa',  '08:45', '09:30', $all],
+        ['MATH', 'Darwin',  '09:50', '10:35', $all],
+        ['READ', 'Crizel',  '10:35', '11:20', $mwf],
+        ['COMP', 'Crizel',  '10:35', '11:20', $tth],
+        ['HGP',  'Khaycee', '12:45', '13:00', $mwf],
+        ['FIL',  'Jezza',   '13:00', '13:45', $all],
+        ['SCI',  'Liemer',  '13:45', '14:30', $all],
+        ['SOC',  'Khaycee', '14:50', '15:35', $all],
+    ];
+
+    $teacherIds = [];
+    $created    = 0;
+
+    foreach ($staff as $first => [$last, $departmentCode]) {
+        $existing = $db->selectOne(
+            'SELECT teacher_id FROM teachers WHERE first_name = :f AND last_name = :l AND deleted_at IS NULL',
+            ['f' => $first, 'l' => $last]
+        );
+
+        if ($existing !== null) {
+            $teacherIds[$first] = (int) $existing['teacher_id'];
+        } else {
+            $departmentId = (int) $db->scalar(
+                'SELECT department_id FROM departments WHERE department_code = :c AND deleted_at IS NULL',
+                ['c' => $departmentCode]
+            );
+
+            if ($departmentId === 0) {
+                fail(sprintf('No department "%s". Run the migrations first.', $departmentCode));
+            }
+
+            $teacherIds[$first] = (int) $db->insert('teachers', [
+                'employee_number' => 'TAPS-' . strtoupper(substr($first, 0, 3)) . '-' . str_pad((string) (count($teacherIds) + 1), 3, '0', STR_PAD_LEFT),
+                'department_id'   => $departmentId,
+                'first_name'      => $first,
+                'last_name'       => $last,
+                // Required, and a placeholder rather than a guess: inventing
+                // a plausible address for a real member of staff is how a
+                // password reset ends up somewhere it should not.
+                'email'           => strtolower($first . '.' . $last) . '@taps.invalid',
+                'position'        => 'Teacher',
+                'status'          => 'active',
+                'hired_at'        => Clock::now()->format('Y-m-d'),
+                'created_at'      => Clock::nowString(),
+                'updated_at'      => Clock::nowString(),
+            ]);
+            $created++;
+        }
+
+        // Grade 3, or ScheduleService refuses: a teacher with no grade levels
+        // cannot be given a section, and the section's grade must be among them.
+        $db->execute(
+            'INSERT OR IGNORE INTO teacher_grade_levels (teacher_id, grade_level_id, assigned_by, created_at)
+             VALUES (:t, :g, :u, :n)',
+            ['t' => $teacherIds[$first], 'g' => (int) $section['grade_level_id'], 'u' => $adminId, 'n' => Clock::nowString()]
+        );
+    }
+
+    // A teacher who takes subjects from more than one department needs the
+    // extra ones recorded, or every schedule for them is refused with
+    // "Cross-department assignment blocked". Ms. Crizel is the case on this
+    // timetable: Reading is English, Computer is Computer.
+    //
+    // teacher_departments rather than teacher_department_exceptions. The
+    // exception route needs a global setting turned on, a reason and a date
+    // range, and is meant for a temporary dispensation; this is not temporary,
+    // it is simply what she teaches. A secondary department says that plainly
+    // and needs nothing switched on.
+    $secondary = 0;
+
+    foreach ($periods as [$subjectCode, $teacher]) {
+        $subjectDepartment = (int) $db->scalar(
+            'SELECT department_id FROM subjects WHERE subject_code = :c AND deleted_at IS NULL',
+            ['c' => $subjectCode]
+        );
+
+        $primary = (int) $db->scalar(
+            'SELECT department_id FROM teachers WHERE teacher_id = :t',
+            ['t' => $teacherIds[$teacher]]
+        );
+
+        if ($subjectDepartment === 0 || $subjectDepartment === $primary) {
+            continue;
+        }
+
+        $secondary += $db->execute(
+            'INSERT OR IGNORE INTO teacher_departments (teacher_id, department_id, is_primary, assigned_by, created_at)
+             VALUES (:t, :d, 0, :u, :n)',
+            ['t' => $teacherIds[$teacher], 'd' => $subjectDepartment, 'u' => $adminId, 'n' => Clock::nowString()]
+        );
+    }
+
+    out(sprintf('  %d teacher(s) created, %d already present.', $created, count($staff) - $created), 'grey');
+
+    if ($secondary > 0) {
+        out(sprintf('  %d secondary department(s) recorded for teachers who cross one.', $secondary), 'grey');
+    }
+
+    out('');
+
+    // ------------------------------------------------------------- the week --
+    $added   = 0;
+    $skipped = 0;
+    $failed  = [];
+
+    foreach ($periods as [$subjectCode, $teacher, $start, $end, $days]) {
+        $subjectId = (int) $db->scalar(
+            'SELECT subject_id FROM subjects WHERE subject_code = :c AND deleted_at IS NULL',
+            ['c' => $subjectCode]
+        );
+
+        if ($subjectId === 0) {
+            $failed[] = sprintf('%s: no such subject', $subjectCode);
+            continue;
+        }
+
+        // A fifteen-minute period cannot carry the windows a forty-five minute
+        // one does: chk_sched_windows wants the lesson to outlast its tap-in
+        // window plus its tap-out window, so HGP gets its own tighter set.
+        $short  = (strtotime($end) - strtotime($start)) / 60 <= 20;
+        $window = $short
+            ? ['in_open' => 5, 'in_close' => 8,  'late' => 3,  'out_open' => 5,  'out_close' => 10, 'dwell' => 5]
+            : ['in_open' => 10, 'in_close' => 20, 'late' => 10, 'out_open' => 15, 'out_close' => 15, 'dwell' => 20];
+
+        foreach ($days as $day) {
+            $duplicate = (int) $db->scalar(
+                "SELECT COUNT(*) FROM schedules
+                  WHERE section_id = :s AND day_of_week = :d AND start_time = :t
+                    AND status = 'active' AND deleted_at IS NULL",
+                ['s' => (int) $section['section_id'], 'd' => $day, 't' => $start . ':00']
+            );
+
+            if ($duplicate > 0) {
+                $skipped++;
+                continue;
+            }
+
+            try {
+                ScheduleService::create([
+                    'teacher_id'   => $teacherIds[$teacher],
+                    'subject_id'   => $subjectId,
+                    'section_id'   => (int) $section['section_id'],
+                    'classroom_id' => (int) $classroom['classroom_id'],
+                    'day_of_week'  => $day,
+                    'start_time'   => $start,
+                    'end_time'     => $end,
+                    'time_in_window_open'    => $window['in_open'],
+                    'time_in_window_close'   => $window['in_close'],
+                    'late_threshold_minutes' => $window['late'],
+                    'time_out_window_open'   => $window['out_open'],
+                    'time_out_window_close'  => $window['out_close'],
+                    'minimum_dwell_minutes'  => $window['dwell'],
+                ], $adminId, true);
+
+                $added++;
+            } catch (Throwable $e) {
+                $failed[] = sprintf('%s %s %s: %s', $day, $start, $subjectCode, $e->getMessage());
+            }
+        }
+    }
+
+    out(sprintf('  %d period(s) created, %d already there.', $added, $skipped), $added > 0 ? 'green' : 'grey');
+
+    if ($failed !== []) {
+        out('');
+        out('  These were refused:', 'yellow');
+
+        foreach ($failed as $line) {
+            out('    ' . $line, 'grey');
+        }
+    }
+
+    out('');
+    out('  Not created, deliberately: the 7:45 Before Class Activity, both break', 'grey');
+    out('  times, lunch and home time. None has a teacher on the printed schedule,', 'grey');
+    out('  and a session opens on a fingerprint - a period nobody teaches cannot', 'grey');
+    out('  open one. Tuesday and Thursday 12:45 is BCA for the same reason.', 'grey');
+    // Admin -> Teachers is what this used to say, and it was wrong: that form
+    // edits a staff record, it does not issue a password to one that already
+    // exists. A teacher who is on the timetable and cannot sign in is a fault
+    // nobody reports as a fault, so the fix is named here rather than left to
+    // be found — and only while it is still outstanding, so a second run of
+    // this command does not send anybody off to fix something already done.
+    $withoutLogin = (int) $db->scalar(sprintf(
+        'SELECT COUNT(*) FROM teachers WHERE user_id IS NULL AND deleted_at IS NULL AND teacher_id IN (%s)',
+        implode(',', array_map('intval', $teacherIds))
+    ));
+
+    if ($withoutLogin > 0) {
+        out('');
+        out($withoutLogin === 1
+            ? '  One of these teachers has a staff record but no password. Run:'
+            : sprintf('  %d of these teachers have staff records but no passwords. Run:', $withoutLogin), 'yellow');
+        out('');
+        out('      console.bat user:create-teachers', 'cyan');
+        out('');
+        out('  It gives each of them their first name as a username and prints a', 'grey');
+        out('  password once, which they change at their first sign-in.', 'grey');
+    }
+
+    $failed === [] ? ok('Timetable built.') : fail(sprintf('%d period(s) refused - see above.', count($failed)));
+}

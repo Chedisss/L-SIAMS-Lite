@@ -1,0 +1,35 @@
+/vendor/
+/.env
+/storage/logs/*.log
+/storage/cache/*
+/storage/reports/*
+/storage/tmp/*
+/storage/framework/sessions/*
+# The database itself, and SQLite's -wal and -shm files beside it. Never
+# tracked: update.bat replaces every tracked file, and this is the school's data.
+/storage/database/*
+# The school's certificate authority and the server key it signs. Private keys,
+# and a repository is the last place they should be able to reach.
+/storage/tls/*
+/database/backups/*.sql
+/database/backups/*.gz
+/database/backups/*.enc
+/database/backups/*.lsiams
+/public/uploads/students/*
+/public/uploads/teachers/*
+!.gitkeep
+.DS_Store
+*.swp
+node_modules/
+
+# Terminal credentials. The sketch is tracked and update.bat replaces every
+# tracked file, so both of these have to be invisible to git or the update
+# would eat them: the optional secrets.h, and the copy update.bat saves of a
+# sketch you had edited.
+/firmware/*/secrets.h
+# The school's root certificate, copied in from storage/tls. Public and safe to
+# share, but specific to one installation — and tracked files are exactly what
+# update.bat overwrites, which would silently take a terminal's ability to
+# verify the server with it.
+/firmware/*/ls_root_ca.h
+/firmware/*/*.ino.your-copy

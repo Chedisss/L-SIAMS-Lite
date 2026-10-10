@@ -1,0 +1,62 @@
+<?php
+declare(strict_types=1);
+
+use App\Core\Env;
+
+return [
+    'name'      => Env::get('APP_NAME', 'L-SIAMS'),
+    'full_name' => 'Local IoT-Based Multi-Layer Secured Attendance Monitoring System',
+    'env'       => Env::get('APP_ENV', 'production'),
+    'debug'     => Env::bool('APP_DEBUG', false),
+    'url'       => rtrim((string) Env::get('APP_URL', 'https://192.168.1.10'), '/'),
+    'timezone'  => Env::get('APP_TIMEZONE', 'Asia/Manila'),
+
+    // A relative time added to every clock read, for testing a schedule
+    // without waiting for its window. "+2 hours", "-30 minutes",
+    // "next monday 08:05". Empty in normal use, and ignored outright when
+    // APP_ENV is production. See Clock::offset().
+    'clock_offset' => Env::get('APP_CLOCK_OFFSET', ''),
+    'version'   => '1.0.0',
+
+    // Paths are resolved once here so nothing else has to guess at directory layout.
+    'paths' => [
+        'root'       => BASE_PATH,
+        'app'        => BASE_PATH . '/app',
+        'views'      => BASE_PATH . '/app/Views',
+        'storage'    => BASE_PATH . '/storage',
+        'logs'       => BASE_PATH . '/storage/logs',
+        'reports'    => BASE_PATH . '/storage/reports',
+        'cache'      => BASE_PATH . '/storage/cache',
+        'tmp'        => BASE_PATH . '/storage/tmp',
+        'sessions'   => BASE_PATH . '/storage/framework/sessions',
+        // Certificates and the private keys behind them. Under storage/ so it
+        // is never inside the document root: a server key served over HTTP is
+        // the end of the security of the whole installation, and one stray
+        // Alias line in httpd.conf is all that would take.
+        'tls'        => BASE_PATH . '/storage/tls',
+        'backups'    => BASE_PATH . '/database/backups',
+        'migrations' => BASE_PATH . '/database/migrations',
+        'seeders'    => BASE_PATH . '/database/seeders',
+        'uploads'    => BASE_PATH . '/public/uploads',
+        'public'     => BASE_PATH . '/public',
+    ],
+
+    'pagination' => [
+        'default_per_page' => 25,
+        'allowed'          => [10, 25, 50, 100],
+        'max_per_page'     => 100,
+    ],
+
+    'uploads' => [
+        'max_bytes'          => 4 * 1024 * 1024,
+        'image_extensions'   => ['jpg', 'jpeg', 'png'],
+        'image_mimes'        => ['image/jpeg', 'image/png'],
+        'document_extensions' => ['csv', 'xlsx', 'pdf'],
+        'document_mimes'     => [
+            'text/csv', 'text/plain', 'application/csv',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/pdf',
+        ],
+    ],
+];
