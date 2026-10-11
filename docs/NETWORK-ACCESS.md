@@ -45,6 +45,22 @@ Connect it and run `start.bat` again.
 
 ## Step 2 — Allow it through Windows Firewall (first time only)
 
+**The quick way:** double-click **`allow-network.bat`** in the L-SIAMS folder
+and click **Yes** when Windows asks for administrator rights. In one go it:
+
+- sets the network this PC is on to **Private** (on a *Public* network Windows
+  turns other devices away however the firewall is set);
+- removes any rule Windows made to **block PHP**, which it does when its
+  "allow PHP?" box was cancelled or closed, and which overrides every allow
+  rule;
+- opens ports 8080 and 8443 on private networks only;
+- checks that `.env` lets your network's addresses in;
+- prints the address to type on the other devices.
+
+It is safe to run again. If it marks anything `[X]`, it says what to do. The
+rest of this step is the same thing by hand.
+
+
 The first time you run `start.bat`, Windows shows:
 
 > **Windows Defender Firewall has blocked some features of PHP**

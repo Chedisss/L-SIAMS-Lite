@@ -295,12 +295,16 @@ if defined HTTPSMODE (
 )
 
 REM Find this PC's address on the school network so the other devices can be
-REM told where to go. Picking the first IPv4 that is not loopback is right on
-REM the overwhelmingly common single-adapter machine; a PC on both Wi-Fi and
-REM Ethernet may show the other one, which is why the address is printed for
-REM the operator to read rather than written into any configuration.
+REM told where to go. bin\lan-address.ps1 takes the adapter that has a router,
+REM so a VirtualBox or Hyper-V adapter is not shown in its place. A PC on both
+REM Wi-Fi and Ethernet may still show the other one, which is why the address
+REM is printed for the operator to read rather than written into any configuration.
 set "LANIP="
-for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4 Address"') do (
+for /f "delims=" %%A in ('powershell -NoProfile -ExecutionPolicy Bypass -File "bin\lan-address.ps1" 2^>nul') do (
+    if not defined LANIP set "LANIP=%%A"
+)
+REM Fallback when PowerShell cannot answer: the first IPv4 in ipconfig.
+if not defined LANIP for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4 Address"') do (
     if not defined LANIP (
         for /f "tokens=* delims= " %%B in ("%%A") do (
             if not "%%B"=="127.0.0.1" set "LANIP=%%B"
@@ -340,10 +344,9 @@ if defined LANIP (
     echo      On other devices:  http://%LANIP%:%WEB_PORT%
     echo.
     echo    Phones, tablets and laptops on the same Wi-Fi can
-    echo    open that second address. The first time, Windows
-    echo    Firewall will ask to allow PHP - choose Private
-    echo    networks and click Allow access. If nothing loads,
-    echo    see docs\NETWORK-ACCESS.md
+    echo    open that second address. If they cannot reach
+    echo    it, double-click allow-network.bat once ^(it asks
+    echo    for administrator rights^) and try again.
 ) else (
     echo.
     echo    This PC has no network address yet, so other devices
