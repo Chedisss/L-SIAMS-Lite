@@ -262,6 +262,14 @@ if defined FIRSTRUN (
     echo   ------------------------------------------------
     echo.
     "%PHP%" bin\console user:create-admin
+    if errorlevel 1 (
+        echo.
+        echo   [X] No administrator account was created, so nobody can sign in yet.
+        echo       Open a Command Prompt in this folder and run:
+        echo         console.bat user:create-admin
+        echo.
+        pause
+    )
     echo.
     echo   Tip: to fill the system with sample students and
     echo        attendance so every page has data, close this
