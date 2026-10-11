@@ -89,6 +89,10 @@ and opens the browser at <http://localhost:8080>.
 Three windows stay open while the system runs — the site, the maintenance
 worker and the realtime server. **`stop.bat`** closes all three.
 
+Other devices on the same network open it at the address `start.bat` prints.
+If they cannot reach it, double-click **`allow-network.bat`** once; it sets up
+Windows Firewall for you ([`docs/NETWORK-ACCESS.md`](docs/NETWORK-ACCESS.md)).
+
 When something is wrong and it is not obvious why, double-click
 **`doctor.bat`**. It checks PHP, the keys, the database, the migrations,
 whether `APP_KEY` still opens the encrypted data, every registered terminal
@@ -99,6 +103,7 @@ and the realtime server, and changes nothing.
 
 ```
 doctor.bat                     check the installation and report problems
+allow-network.bat              let other devices on the network reach it
 import-from-mariadb.bat        bring the data over from the MariaDB version
 console.bat seed --demo        fill the system with sample data
 console.bat user:create-admin  add another administrator

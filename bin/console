@@ -104,7 +104,33 @@ function prompt(string $question, bool $hidden = false): string
         return $value;
     }
 
-    return trim((string) fgets(STDIN));
+    $line = fgets(STDIN);
+
+    if ($line === false) {
+        fail('No answer was given (input closed).');
+    }
+
+    return trim($line);
+}
+
+/**
+ * Asks until $problem returns null for the answer, printing what was wrong
+ * each time.
+ *
+ * @param callable(string): ?string $problem
+ */
+function promptUntil(string $question, callable $problem): string
+{
+    while (true) {
+        $value   = prompt($question);
+        $message = $problem($value);
+
+        if ($message === null) {
+            return $value;
+        }
+
+        out('  ✗ ' . $message, 'red');
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1804,47 +1830,52 @@ function commandCreateAdmin(): void
         fail('The administrator role does not exist. Run "php bin/console seed" first.');
     }
 
-    $fullName = prompt('Full name');
-    $username = strtolower(prompt('Username'));
-    $email    = strtolower(prompt('Email'));
+    // Each answer is asked again until it is usable. This runs inside
+    // start.bat on the first run, where quitting on one empty answer left the
+    // system started with no account anyone could sign in with.
+    $taken = static fn (string $column, string $value): bool =>
+        $db->scalar("SELECT 1 FROM users WHERE {$column} = :v LIMIT 1", ['v' => $value]) !== null;
 
-    if ($fullName === '' || $username === '' || $email === '') {
-        fail('All fields are required.');
-    }
+    $fullName = promptUntil('Full name', static fn (string $v): ?string =>
+        $v === '' ? 'Enter the full name, e.g. Juan Dela Cruz.' : null);
 
-    if (preg_match('/^[a-z0-9._-]{4,32}$/', $username) !== 1) {
-        fail('Username must be 4–32 characters: letters, numbers, dot, underscore or hyphen.');
-    }
+    $username = strtolower(promptUntil('Username', static fn (string $v): ?string => match (true) {
+        preg_match('/^[a-z0-9._-]{4,32}$/i', $v) !== 1 => 'Username must be 4–32 characters: letters, numbers, dot, underscore or hyphen.',
+        $taken('username', strtolower($v))             => 'That username is already registered.',
+        default                                        => null,
+    }));
 
-    if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
-        fail('That email address is not valid.');
-    }
+    $email = strtolower(promptUntil('Email', static fn (string $v): ?string => match (true) {
+        filter_var($v, FILTER_VALIDATE_EMAIL) === false => 'That email address is not valid.',
+        $taken('email', strtolower($v))                 => 'That email address is already registered.',
+        default                                         => null,
+    }));
 
-    if ($db->scalar('SELECT 1 FROM users WHERE username = :u OR email = :e LIMIT 1',
-        ['u' => $username, 'e' => $email]) !== null) {
-        fail('That username or email address is already registered.');
-    }
-
-    $password = prompt('Password (blank to generate one)', true);
     $generated = false;
 
-    if ($password === '') {
-        $password  = App\Services\PasswordPolicyService::generate();
-        $generated = true;
-    } else {
+    while (true) {
+        $password = prompt('Password (blank to generate one)', true);
+
+        if ($password === '') {
+            $password  = App\Services\PasswordPolicyService::generate();
+            $generated = true;
+            break;
+        }
+
         $issues = App\Services\PasswordPolicyService::check($password, [$username, $email, $fullName]);
 
         if ($issues !== []) {
-            out('');
             foreach ($issues as $issue) {
                 out('  ✗ ' . $issue, 'red');
             }
-            exit(1);
+            continue;
         }
 
-        if (prompt('Confirm password', true) !== $password) {
-            fail('Passwords do not match.');
+        if (prompt('Confirm password', true) === $password) {
+            break;
         }
+
+        out('  ✗ Passwords do not match. Try again.', 'red');
     }
 
     $hash = Hash::make($password);
