@@ -48,7 +48,7 @@ $typeDescriptions = [
     'monthly'             => 'A month, day by day.',
     'student'             => 'One student over a range.',
     'teacher'             => 'A teacher\'s sessions.',
-    'teacher_time_in'     => 'When each teacher opened class, against the schedule.',
+    'teacher_time_in'     => 'When each teacher timed in (fingerprint) and out of each class, against the schedule.',
     'subject'             => 'One subject, day by day.',
     'section_daily'       => 'Printable roll-call sheet.',
     'section_summary'     => 'Per-section totals.',
@@ -82,7 +82,7 @@ $shortLabels = [
     'monthly'             => 'Monthly',
     'student'             => 'One student',
     'subject'             => 'By subject',
-    'teacher_time_in'     => 'Time-in',
+    'teacher_time_in'     => 'Time in & out',
     'teacher'             => 'Sessions',
     'adviser'             => 'Adviser',
     'section_daily'       => 'Daily sheet',
@@ -147,6 +147,8 @@ foreach ($schoolYears as $year) {
     .choice i { font-size:.85rem; }
 
     .rtabs__btn i { font-size:.85rem; }
+    /* One line per cell: the preview scrolls sideways rather than wrapping a date onto three lines. */
+    #preview-body td { white-space:nowrap; }
     .choice-grid--3 { grid-template-columns:repeat(3, 1fr); }
     .period-chips { display:flex; flex-wrap:wrap; gap:.3rem; margin-bottom:.45rem; }
     .period-chips button { border:1px solid var(--border, #d9dee6); background:var(--surface, #fff);

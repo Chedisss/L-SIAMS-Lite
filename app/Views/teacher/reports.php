@@ -24,7 +24,7 @@ $typeDescriptions = [
     'weekly'          => 'A week, day by day.',
     'monthly'         => 'A month, day by day.',
     'teacher'         => 'Sessions you ran.',
-    'teacher_time_in' => 'When you opened each class, against the schedule.',
+    'teacher_time_in' => 'When you timed in (fingerprint) and out of each class, against the schedule.',
     'section_daily'   => 'Printable roll-call sheet.',
     'section_summary' => 'Per-student totals for a section.',
 ];
@@ -35,7 +35,7 @@ $typeDescriptions = [
  */
 $tabs = [
     'classes' => ['My classes', 'fa-clipboard-user', ['daily', 'weekly', 'monthly', 'section_daily', 'section_summary']],
-    'timein'  => ['My time-in', 'fa-fingerprint',    ['teacher_time_in', 'teacher']],
+    'timein'  => ['My time in & out', 'fa-fingerprint',    ['teacher_time_in', 'teacher']],
 ];
 
 $shortLabels = [
@@ -44,7 +44,7 @@ $shortLabels = [
     'monthly'         => 'Monthly',
     'section_daily'   => 'Daily sheet',
     'section_summary' => 'Section summary',
-    'teacher_time_in' => 'Time-in',
+    'teacher_time_in' => 'Time in & out',
     'teacher'         => 'Sessions',
 ];
 
@@ -75,6 +75,8 @@ foreach ($tabs as $key => [$label, $icon, $tabTypes]) {
               border-radius:var(--radius-sm, 8px); padding:.6rem .5rem; cursor:pointer;
               font-weight:600; font-size:.83rem; color:var(--text); text-align:center; }
     .choice:hover { border-color:var(--primary, #1e5bd6); }
+    /* One line per cell: the preview scrolls sideways rather than wrapping a date onto three lines. */
+    #preview-body td { white-space:nowrap; }
     .choice.is-active { border-color:var(--primary, #1e5bd6); background:var(--primary-050, rgba(30,91,214,.08));
                         color:var(--primary, #1e5bd6); }
 </style>
