@@ -21,6 +21,7 @@ $fieldsByType = [
     'monthly'             => ['range', 'section_id', 'grade_level_id', 'subject_id', 'teacher_id'],
     'student'             => ['range', 'student_id'],
     'teacher'             => ['range', 'teacher_id'],
+    'teacher_time_in'     => ['range', 'teacher_id'],
     // Naming a subject turns this into that subject day by day, so the date
     // range and the section both narrow it further.
     'subject'             => ['range', 'subject_id', 'grade_level_id', 'section_id'],
@@ -47,6 +48,7 @@ $typeDescriptions = [
     'monthly'             => 'A month, day by day.',
     'student'             => 'One student over a range.',
     'teacher'             => 'A teacher\'s sessions.',
+    'teacher_time_in'     => 'When each teacher opened class, against the schedule.',
     'subject'             => 'One subject, day by day.',
     'section_daily'       => 'Printable roll-call sheet.',
     'section_summary'     => 'Per-section totals.',
@@ -65,7 +67,7 @@ $typeDescriptions = [
  * most-used report leads each group.
  */
 $typeGroups = [
-    'Attendance'   => ['student_summary', 'daily', 'weekly', 'monthly', 'student', 'teacher', 'subject'],
+    'Attendance'   => ['student_summary', 'daily', 'weekly', 'monthly', 'student', 'teacher', 'teacher_time_in', 'subject'],
     'By section'   => ['section_daily', 'section_summary', 'section_comparison', 'adviser', 'section_roster_rfid', 'chronic_absence'],
     'Operations'   => ['device_uptime', 'audit', 'security'],
 ];

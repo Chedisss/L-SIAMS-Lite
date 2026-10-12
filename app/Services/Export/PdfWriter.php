@@ -63,7 +63,7 @@ final class PdfWriter
         string $schoolName = 'L-SIAMS'
     ): string {
         $writer = new self($title, $subtitle, $meta, $schoolName);
-        $writer->setHeaders($headers);
+        $writer->setHeaders($headers, $rows);
         $writer->startPage();
 
         if ($statistics !== []) {
@@ -166,8 +166,11 @@ final class PdfWriter
         return $writer->render();
     }
 
-    /** @param list<string> $headers */
-    private function setHeaders(array $headers): void
+    /**
+     * @param list<string>                  $headers
+     * @param list<array<string|int,mixed>> $rows
+     */
+    private function setHeaders(array $headers, array $rows = []): void
     {
         $this->headers = $headers;
         $available     = self::PAGE_WIDTH - (self::MARGIN * 2);
@@ -176,7 +179,27 @@ final class PdfWriter
         // Weight each column by its header length so "Student Name" gets more
         // room than "Status", rather than dividing the page evenly.
         $weights = array_map(static fn (string $h): float => max(6.0, min(22.0, (float) mb_strlen($h))), $headers);
-        $sum     = array_sum($weights) ?: (float) $count;
+
+        // With rows to go on, weight by what the column actually holds: its
+        // longest value, capped so one very long cell cannot starve the rest.
+        // The header still counts, but only up to 12 characters, so a long
+        // header over short values ("Attendance Percentage" over "95%") does
+        // not take the room a teacher's name needs.
+        if ($rows !== []) {
+            $sample = array_slice($rows, 0, 500);
+
+            foreach ($weights as $index => $_) {
+                $lengths = array_map(
+                    static fn (array $row): int => mb_strlen(self::stringify(array_values($row)[$index] ?? '')),
+                    $sample
+                );
+                $longest = (float) max($lengths);
+
+                $weights[$index] = max(5.0, min(26.0, max($longest, min(12.0, (float) mb_strlen($headers[$index])))));
+            }
+        }
+
+        $sum = array_sum($weights) ?: (float) $count;
 
         $this->columnWidths = array_map(
             static fn (float $w): float => $available * ($w / $sum),

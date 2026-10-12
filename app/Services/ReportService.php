@@ -27,6 +27,7 @@ final class ReportService
         'monthly'               => 'Monthly Attendance',
         'student'               => 'Student Attendance',
         'teacher'               => 'Teacher Attendance',
+        'teacher_time_in'       => 'Teacher Time-In',
         'subject'               => 'Subject Attendance',
         'section_daily'         => 'Section Daily Attendance Sheet',
         'section_summary'       => 'Section Attendance Summary',
@@ -59,6 +60,7 @@ final class ReportService
             'daily', 'weekly', 'monthly' => self::attendanceReport($type, $filters, $from, $to),
             'student'                    => self::studentReport($filters, $from, $to),
             'teacher'                    => self::teacherReport($filters, $from, $to),
+            'teacher_time_in'            => self::teacherTimeInReport($filters, $from, $to),
             'subject'                    => self::subjectReport($filters, $from, $to),
             'section_daily'              => self::sectionDailySheet($filters),
             'section_summary'            => self::sectionSummary($filters, $from, $to),
@@ -626,6 +628,130 @@ final class ReportService
                 'Students'   => $totalRoster,
                 'Attended'   => $totalPresent,
                 'Attendance' => $totalRoster === 0 ? '0%' : round($totalPresent / $totalRoster * 100, 1) . '%',
+            ],
+            'meta' => self::describeFilters($filters, $from, $to),
+        ];
+    }
+
+
+    /**
+     * Teacher Time-In — one row per session: when the class was scheduled to
+     * start, when the teacher actually opened it, and when it was closed.
+     *
+     * "Time in" is the fingerprint scan that opened the class. A session
+     * opened by password override has no scan, so its opening time is used
+     * and "Opened by" says so. A teacher is on time when they opened the class
+     * within the scheduled start minute; anything later is late by the whole
+     * minutes past it. A session closed by the system rather than the teacher
+     * (it ran past its end and expired) or still open counts as not closed.
+     *
+     * All teachers, or one when teacher_id is given; the controller forces
+     * teacher_id for a teacher account, so a teacher sees only their own.
+     *
+     * @param array<string,mixed> $filters @return array<string,mixed>
+     */
+    private static function teacherTimeInReport(array $filters, string $from, string $to): array
+    {
+        $where    = ['s.session_date BETWEEN :from AND :to'];
+        $bindings = ['from' => $from, 'to' => $to];
+
+        if (!empty($filters['teacher_id'])) {
+            $where[]             = 's.teacher_id = :teacher';
+            $bindings['teacher'] = (int) $filters['teacher_id'];
+        }
+
+        $rows = Database::instance()->select(
+            "SELECT s.session_date, s.scheduled_start, s.opened_at, s.closed_at, s.status,
+                    s.closed_by_type, s.opened_method,
+                    t.first_name, t.last_name, t.employee_number,
+                    sub.subject_name, sec.section_code, c.room_number,
+                    fl.created_at AS scanned_at, u.username AS opened_by_username
+               FROM attendance_sessions s
+               JOIN teachers t      ON t.teacher_id = s.teacher_id
+               JOIN subjects sub    ON sub.subject_id = s.subject_id
+               JOIN sections sec    ON sec.section_id = s.section_id
+               JOIN classrooms c    ON c.classroom_id = s.classroom_id
+          LEFT JOIN fingerprint_logs fl ON fl.log_id = s.fingerprint_log_id
+          LEFT JOIN users u         ON u.user_id = s.opened_by_user_id
+              WHERE " . implode(' AND ', $where) . '
+              ORDER BY s.session_date DESC, s.scheduled_start, t.last_name, t.first_name
+              LIMIT 20000',
+            $bindings
+        );
+
+        $onTime = $late = $aborted = $notClosed = $minutesLate = 0;
+        $out    = [];
+
+        foreach ($rows as $r) {
+            $timeIn    = (string) ($r['scanned_at'] ?? $r['opened_at']);
+            // A full date and time; a bare time is read against the session date.
+            $start     = (string) $r['scheduled_start'];
+            $scheduled = Clock::parse(strlen($start) > 8 ? $start : $r['session_date'] . ' ' . $start);
+            $in        = Clock::parse($timeIn);
+            $lateBy    = intdiv($in->getTimestamp() - $scheduled->getTimestamp(), 60);
+
+            if ($r['status'] === 'aborted') {
+                $inStatus = 'Aborted';
+                $aborted++;
+            } elseif ($lateBy > 0) {
+                $inStatus     = sprintf('Late %d min', $lateBy);
+                $late++;
+                $minutesLate += $lateBy;
+            } else {
+                $inStatus = 'On time';
+                $onTime++;
+            }
+
+            if ($r['status'] === 'open' || $r['closed_by_type'] === 'system') {
+                $notClosed++;
+            }
+
+            $duration = $r['closed_at'] === null
+                ? null
+                : intdiv(Clock::parse((string) $r['closed_at'])->getTimestamp() - $in->getTimestamp(), 60);
+
+            $out[] = [
+                self::humanDate((string) $r['session_date']),
+                trim($r['last_name'] . ', ' . $r['first_name']),
+                $r['employee_number'],
+                $r['subject_name'],
+                $r['section_code'],
+                $r['room_number'],
+                $scheduled->format('g:i A'),
+                $in->format('g:i A'),
+                $inStatus,
+                match (true) {
+                    $r['status'] === 'open'           => 'Still open',
+                    $r['closed_by_type'] === 'system' => self::humanTime($r['closed_at']) . ' auto',
+                    default                           => self::humanTime($r['closed_at']),
+                },
+                $duration === null ? '—' : $duration . ' min',
+                $r['opened_method'] === 'password'
+                    ? 'Password' . ($r['opened_by_username'] ? ': ' . $r['opened_by_username'] : '')
+                    : 'Fingerprint',
+            ];
+        }
+
+        $teacherName = '';
+
+        if (!empty($filters['teacher_id'])) {
+            $teacher     = TeacherService::find((int) $filters['teacher_id']);
+            $teacherName = $teacher === null ? '' : $teacher['first_name'] . ' ' . $teacher['last_name'];
+        }
+
+        return [
+            'title'    => 'Teacher Time-In Report',
+            'subtitle' => $teacherName !== '' ? $teacherName : 'All teachers',
+            'headers'  => ['Date', 'Teacher', 'Emp. No.', 'Subject', 'Section', 'Room', 'Scheduled In', 'Time In',
+                           'In Status', 'Time Out', 'Duration', 'Opened By'],
+            'rows'       => $out,
+            'statistics' => [
+                'Sessions held'    => count($rows) - $aborted,
+                'On time'          => $onTime,
+                'Late'             => $late,
+                'Avg minutes late' => $late === 0 ? 0 : round($minutesLate / $late, 1),
+                'Not closed'       => $notClosed,
+                'Aborted'          => $aborted,
             ],
             'meta' => self::describeFilters($filters, $from, $to),
         ];

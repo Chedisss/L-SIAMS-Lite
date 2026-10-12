@@ -13,6 +13,7 @@ $fieldsByType = [
     'weekly'          => ['range', 'section_id', 'subject_id'],
     'monthly'         => ['range', 'section_id', 'subject_id'],
     'teacher'         => ['range'],
+    'teacher_time_in' => ['range'],
     'section_daily'   => ['date', 'section_id'],
     'section_summary' => ['range', 'section_id'],
 ];
@@ -23,13 +24,14 @@ $typeDescriptions = [
     'weekly'          => 'A week, day by day.',
     'monthly'         => 'A month, day by day.',
     'teacher'         => 'Sessions you ran.',
+    'teacher_time_in' => 'When you opened each class, against the schedule.',
     'section_daily'   => 'Printable roll-call sheet.',
     'section_summary' => 'Per-student totals for a section.',
 ];
 
 /** Group the picker so it reads as a short menu rather than a flat list. */
 $typeGroups = [
-    'Attendance' => ['daily', 'weekly', 'monthly', 'teacher'],
+    'Attendance' => ['daily', 'weekly', 'monthly', 'teacher', 'teacher_time_in'],
     'By section' => ['section_daily', 'section_summary'],
 ];
 ?>
