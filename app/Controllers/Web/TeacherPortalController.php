@@ -403,6 +403,7 @@ final class TeacherPortalController extends Controller
                 'weekly'          => 'Weekly Attendance',
                 'monthly'         => 'Monthly Attendance',
                 'teacher'         => 'My Session Summary',
+                'teacher_time_in' => 'My Time-In',
                 'section_daily'   => 'Section Daily Attendance Sheet',
                 'section_summary' => 'Section Attendance Summary',
             ],
