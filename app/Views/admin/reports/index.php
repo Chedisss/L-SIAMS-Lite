@@ -62,43 +62,78 @@ $typeDescriptions = [
 ];
 
 /**
- * Group the report types so the picker reads as a short menu of categories
- * rather than one flat list. Order within a group is deliberate: the
- * most-used report leads each group.
+ * One tab per subject of a report - who or what it is about - so a teacher's
+ * time-in and a student's absences are never in the same list. Each tab shows
+ * its reports as buttons and only the filters the chosen report uses. The
+ * first report of a tab is the one it opens on.
  */
-$typeGroups = [
-    'Attendance'   => ['student_summary', 'daily', 'weekly', 'monthly', 'student', 'teacher', 'teacher_time_in', 'subject'],
-    'By section'   => ['section_daily', 'section_summary', 'section_comparison', 'adviser', 'section_roster_rfid', 'chronic_absence'],
-    'Operations'   => ['device_uptime', 'audit', 'security'],
+$tabs = [
+    'students' => ['Students', 'fa-user-graduate',   ['student_summary', 'daily', 'weekly', 'monthly', 'student', 'subject']],
+    'teachers' => ['Teachers', 'fa-fingerprint'    , ['teacher_time_in', 'teacher', 'adviser']],
+    'sections' => ['Sections', 'fa-clipboard-user',  ['section_daily', 'section_summary', 'section_comparison', 'section_roster_rfid', 'chronic_absence']],
+    'system'   => ['System',   'fa-shield-halved',   ['device_uptime', 'audit', 'security']],
 ];
+
+/** Short names for the report buttons; the full name is the button's title. */
+$shortLabels = [
+    'student_summary'     => 'Summary',
+    'daily'               => 'Daily',
+    'weekly'              => 'Weekly',
+    'monthly'             => 'Monthly',
+    'student'             => 'One student',
+    'subject'             => 'By subject',
+    'teacher_time_in'     => 'Time-in',
+    'teacher'             => 'Sessions',
+    'adviser'             => 'Adviser',
+    'section_daily'       => 'Daily sheet',
+    'section_summary'     => 'Summary',
+    'section_comparison'  => 'Compare',
+    'section_roster_rfid' => 'RFID roster',
+    'chronic_absence'     => 'Chronic absence',
+    'device_uptime'       => 'Terminals',
+    'audit'               => 'Audit log',
+    'security'            => 'Security log',
+];
+
 // Report types teachers may never run, even if they somehow reach this view.
 $teacherHidden = ['audit', 'security', 'device_uptime'];
+
+foreach ($tabs as $key => [$label, $icon, $tabTypes]) {
+    $visible = array_values(array_filter(
+        $tabTypes,
+        fn ($t) => isset($types[$t]) && !($isTeacher && in_array($t, $teacherHidden, true))
+    ));
+
+    if ($visible === []) {
+        unset($tabs[$key]);
+    } else {
+        $tabs[$key][2] = $visible;
+    }
+}
+
+$currentYearRow = null;
+foreach ($schoolYears as $year) {
+    if ((int) $year['school_year_id'] === (int) $currentYear) {
+        $currentYearRow = $year;
+    }
+}
 ?>
 
 <?php $__view->include('partials.page-header', [
     'title'       => 'Reports',
-    'subtitle'    => 'Start with Quick summary for an at-a-glance attendance roll of every student, or open the Advanced builder for the full set of reports. Exports carry every row; the on-screen preview is capped so the browser stays responsive.',
+    'subtitle'    => 'Pick a tab, pick a report, set the filters, then Preview. PDF and Excel exports carry every row; the on-screen preview is capped so the browser stays responsive.',
     'breadcrumbs' => [['Dashboard', $base], ['Reports', null]],
 ]); ?>
 
 <style nonce="<?= e(csp_nonce()) ?>">
     /* ---- report tab switch --------------------------------------------- */
-    .rtabs { display:flex; gap:.35rem; margin-bottom:1rem; background:var(--surface-alt);
+    .rtabs { display:flex; gap:.35rem; margin-bottom:1rem; background:var(--surface-alt); max-width:720px;
              padding:.3rem; border-radius:var(--radius-md, 10px); }
     .rtabs__btn { flex:1; border:0; background:transparent; cursor:pointer; padding:.55rem .6rem;
                   border-radius:var(--radius-sm, 8px); font-weight:600; font-size:.85rem;
                   color:var(--text-muted); display:flex; align-items:center; justify-content:center;
                   gap:.4rem; transition:background .12s, color .12s; }
     .rtabs__btn.is-active { background:var(--surface, #fff); color:var(--text); box-shadow:var(--shadow-sm, 0 1px 2px rgba(0,0,0,.08)); }
-
-    /* ---- guided steps --------------------------------------------------- */
-    .wiz-step { margin-bottom:1.15rem; }
-    .wiz-step__label { display:flex; align-items:center; gap:.5rem; font-weight:600;
-                       font-size:.82rem; margin-bottom:.5rem; }
-    .wiz-step__num { display:inline-flex; align-items:center; justify-content:center;
-                     width:1.35rem; height:1.35rem; border-radius:999px; background:var(--primary, #1e5bd6);
-                     color:#fff; font-size:.72rem; font-weight:700; flex:none; }
-    .wiz-step__hint { color:var(--text-muted); font-weight:400; font-size:.75rem; }
 
     .choice-grid { display:grid; grid-template-columns:repeat(2, 1fr); gap:.4rem; }
     .choice { border:1px solid var(--border, #d9dee6); background:var(--surface, #fff);
@@ -111,171 +146,42 @@ $teacherHidden = ['audit', 'security', 'device_uptime'];
                         color:var(--primary, #1e5bd6); }
     .choice i { font-size:.85rem; }
 
-    .wiz-summary { background:var(--surface-alt); border-radius:var(--radius-sm, 8px);
-                   padding:.6rem .7rem; font-size:.8rem; color:var(--text-muted); line-height:1.5; }
-    .wiz-summary strong { color:var(--text); font-weight:600; }
+    .rtabs__btn i { font-size:.85rem; }
+    .choice-grid--3 { grid-template-columns:repeat(3, 1fr); }
+    .period-chips { display:flex; flex-wrap:wrap; gap:.3rem; margin-bottom:.45rem; }
+    .period-chips button { border:1px solid var(--border, #d9dee6); background:var(--surface, #fff);
+                           border-radius:999px; padding:.2rem .65rem; font-size:.75rem; cursor:pointer;
+                           color:var(--text-muted); }
+    .period-chips button:hover { border-color:var(--primary, #1e5bd6); color:var(--primary, #1e5bd6); }
 </style>
 
-<div class="grid" style="grid-template-columns:360px 1fr;align-items:start">
+<div class="rtabs" role="tablist">
+    <?php $first = true; foreach ($tabs as $key => [$label, $icon, $tabTypes]): ?>
+        <button type="button" class="rtabs__btn<?= $first ? ' is-active' : '' ?>" data-tab="<?= e($key) ?>"
+                data-first="<?= e($tabTypes[0]) ?>" role="tab">
+            <i class="fa-solid <?= e($icon) ?>"></i> <?= e($label) ?>
+        </button>
+    <?php $first = false; endforeach; ?>
+</div>
+
+<div class="grid" style="grid-template-columns:360px minmax(0, 1fr);align-items:start">
     <div>
-        <div class="rtabs" role="tablist">
-            <button type="button" class="rtabs__btn is-active" data-tab="quick" role="tab">
-                <i class="fa-solid fa-wand-magic-sparkles"></i> Quick summary
-            </button>
-            <button type="button" class="rtabs__btn" data-tab="advanced" role="tab">
-                <i class="fa-solid fa-sliders"></i> Advanced builder
-            </button>
-        </div>
-
-        <!-- ============================ QUICK SUMMARY ==================== -->
-        <div class="card" id="quick-panel">
-            <div class="card__header"><h2 class="card__title">Summarize attendance</h2></div>
-            <div class="card__body">
-
-                <!-- Step 1 · period -->
-                <div class="wiz-step">
-                    <div class="wiz-step__label">
-                        <span class="wiz-step__num">1</span> Period
-                    </div>
-                    <div class="choice-grid" id="q-period">
-                        <button type="button" class="choice is-active" data-period="today">Today</button>
-                        <button type="button" class="choice" data-period="week">This week</button>
-                        <button type="button" class="choice" data-period="month">This month</button>
-                        <button type="button" class="choice" data-period="sy">School year</button>
-                        <button type="button" class="choice" data-period="custom" style="grid-column:1 / -1">
-                            <i class="fa-solid fa-calendar-days"></i> Custom dates…
-                        </button>
-                    </div>
-                    <div class="form-grid mt-2" data-field="q-custom" hidden>
-                        <div class="form-group">
-                            <label for="q-from">From</label>
-                            <input type="date" id="q-from" value="<?= e($defaultFrom) ?>">
-                        </div>
-                        <div class="form-group">
-                            <label for="q-to">To</label>
-                            <input type="date" id="q-to" value="<?= e($defaultTo) ?>">
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 2 · school year -->
-                <div class="wiz-step">
-                    <div class="wiz-step__label">
-                        <span class="wiz-step__num">2</span> School year
-                    </div>
-                    <select id="q-year">
-                        <?php if ($schoolYears === []): ?>
-                            <option value="">No school year configured</option>
-                        <?php else: ?>
-                            <?php foreach ($schoolYears as $year): ?>
-                                <option value="<?= e($year['school_year_id']) ?>"
-                                        data-start="<?= e($year['start_date']) ?>"
-                                        data-end="<?= e($year['end_date']) ?>"
-                                        <?= (int) $year['school_year_id'] === (int) $currentYear ? 'selected' : '' ?>>
-                                    <?= e($year['year_label']) ?><?= (int) $year['is_current'] === 1 ? ' (current)' : '' ?>
-                                </option>
-                            <?php endforeach; ?>
-                        <?php endif; ?>
-                    </select>
-                </div>
-
-                <!-- Step 3 · who -->
-                <div class="wiz-step">
-                    <div class="wiz-step__label">
-                        <span class="wiz-step__num">3</span> Who
-                    </div>
-                    <div class="choice-grid" id="q-scope">
-                        <button type="button" class="choice is-active" data-scope="section">
-                            <i class="fa-solid fa-users"></i> A section
-                        </button>
-                        <button type="button" class="choice" data-scope="student">
-                            <i class="fa-solid fa-user"></i> One student
-                        </button>
-                    </div>
-
-                    <!-- section scope -->
-                    <div data-field="q-section-scope" class="mt-2">
-                        <div class="form-group">
-                            <label for="q-grade">Grade level</label>
-                            <select id="q-grade">
-                                <option value="">All grade levels</option>
-                                <?php foreach ($gradeLevels as $grade): ?>
-                                    <option value="<?= e($grade['grade_level_id']) ?>"><?= e($grade['grade_level_name']) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label for="q-section">Section</label>
-                            <select id="q-section">
-                                <option value="">Every section in this year</option>
-                                <?php foreach ($pickerSections as $section): ?>
-                                    <option value="<?= e($section['section_id']) ?>"
-                                            data-year="<?= e($section['school_year_id']) ?>"
-                                            data-grade="<?= e($section['grade_level_id']) ?>">
-                                        <?= e($section['section_code']) ?> — <?= e($section['section_name']) ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                            <span class="field-help">Leave on “Every section” for the whole school year.</span>
-                        </div>
-                    </div>
-
-                    <!-- student scope -->
-                    <div data-field="q-student-scope" class="mt-2" hidden>
-                        <div class="form-group">
-                            <label for="q-student-search">Student</label>
-                            <input type="search" id="q-student-search" placeholder="Search by name or student number"
-                                   autocomplete="off">
-                            <input type="hidden" id="q-student">
-                            <div class="typeahead" id="q-student-results" hidden></div>
-                            <span class="field-help" id="q-student-chosen">No student selected.</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="wiz-summary mb-2" id="q-summary"></div>
-
-                <button type="button" class="btn btn-primary btn-block" id="q-run">
-                    <i class="fa-solid fa-chart-simple"></i> Preview summary
-                </button>
-
-                <?php if (!$isTeacher): ?>
-                    <button type="button" class="btn btn-secondary btn-block mt-1" id="q-cards">
-                        <i class="fa-solid fa-id-card"></i> Printable student cards (PDF)
-                    </button>
-                    <p class="field-help mt-1">
-                        One page per student — each summary expanded into their day-by-day
-                        attendance. Best run for a section or a grade at report-card time.
-                    </p>
-                <?php endif; ?>
-            </div>
-        </div>
-
-        <!-- ============================ ADVANCED ========================= -->
-        <div class="card" id="advanced-panel" hidden>
-            <div class="card__header"><h2 class="card__title">Build a report</h2></div>
-
+        <div class="card">
             <div class="card__body">
                 <form id="report-form">
+                    <input type="hidden" name="type" id="r-type" value="<?= e(reset($tabs)[2][0]) ?>">
+
                     <div class="form-group">
-                        <label for="r-type" class="required">Report type</label>
-                        <select id="r-type" name="type" required>
-                            <?php foreach ($typeGroups as $groupLabel => $groupTypes): ?>
-                                <?php
-                                // Skip a whole group if the viewer can run nothing in it.
-                                $visible = array_filter(
-                                    $groupTypes,
-                                    fn ($t) => isset($types[$t]) && !($isTeacher && in_array($t, $teacherHidden, true))
-                                );
-                                if ($visible === []) { continue; }
-                                ?>
-                                <optgroup label="<?= e($groupLabel) ?>">
-                                    <?php foreach ($visible as $value): ?>
-                                        <option value="<?= e($value) ?>"><?= e($types[$value]) ?></option>
-                                    <?php endforeach; ?>
-                                </optgroup>
-                            <?php endforeach; ?>
-                        </select>
+                        <label>Report</label>
+                        <?php $first = true; foreach ($tabs as $key => [$label, $icon, $tabTypes]): ?>
+                            <div class="choice-grid choice-grid--3" data-tab-panel="<?= e($key) ?>"<?= $first ? '' : ' hidden' ?>>
+                                <?php foreach ($tabTypes as $value): ?>
+                                    <button type="button" class="choice" data-type="<?= e($value) ?>" title="<?= e($types[$value]) ?>">
+                                        <?= e($shortLabels[$value] ?? $types[$value]) ?>
+                                    </button>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php $first = false; endforeach; ?>
                         <span class="field-help" id="r-type-desc"></span>
                     </div>
 
@@ -284,7 +190,18 @@ $teacherHidden = ['audit', 'security', 'device_uptime'];
                         <input type="date" id="r-date" name="date" value="<?= e($defaultTo) ?>">
                     </div>
 
-                    <div class="form-grid" data-field="range">
+                    <div data-field="range">
+                        <div class="period-chips" id="r-periods">
+                            <button type="button" data-period="today">Today</button>
+                            <button type="button" data-period="week">This week</button>
+                            <button type="button" data-period="month">This month</button>
+                            <?php if ($currentYearRow !== null): ?>
+                                <button type="button" data-period="sy"
+                                        data-start="<?= e($currentYearRow['start_date']) ?>"
+                                        data-end="<?= e($currentYearRow['end_date']) ?>">School year</button>
+                            <?php endif; ?>
+                        </div>
+                        <div class="form-grid">
                         <div class="form-group">
                             <label for="r-from">From</label>
                             <input type="date" id="r-from" name="date_from" value="<?= e($defaultFrom) ?>">
@@ -292,6 +209,7 @@ $teacherHidden = ['audit', 'security', 'device_uptime'];
                         <div class="form-group">
                             <label for="r-to">To</label>
                             <input type="date" id="r-to" name="date_to" value="<?= e($defaultTo) ?>">
+                        </div>
                         </div>
                     </div>
 
@@ -413,6 +331,18 @@ $teacherHidden = ['audit', 'security', 'device_uptime'];
                             <i class="fa-solid fa-rotate-left"></i> Reset
                         </button>
                     </div>
+
+                    <?php if (!$isTeacher): ?>
+                        <div data-tab-panel="students">
+                            <button type="button" class="btn btn-secondary btn-block mt-1" id="r-cards">
+                                <i class="fa-solid fa-id-card"></i> Printable student cards (PDF)
+                            </button>
+                            <p class="field-help mt-1">
+                                One page per student with their day-by-day attendance, for the
+                                section, grade or student chosen above.
+                            </p>
+                        </div>
+                    <?php endif; ?>
                 </form>
             </div>
         </div>
@@ -423,7 +353,7 @@ $teacherHidden = ['audit', 'security', 'device_uptime'];
             <div class="card__header">
                 <div>
                     <h2 class="card__title" id="preview-title">Preview</h2>
-                    <div class="text-xs text-muted" id="preview-subtitle">Choose a period and press Preview summary.</div>
+                    <div class="text-xs text-muted" id="preview-subtitle">Choose a report and press Preview.</div>
                 </div>
                 <div class="flex gap-1" id="export-buttons">
                     <label class="checkbox" style="margin-right:.5rem">
@@ -536,8 +466,6 @@ $__view->start('scripts');
     /* ==================================================================== *
      *  Shared preview + export
      * ==================================================================== */
-    let activeTab = 'quick';
-
     function renderPreview(data) {
         document.getElementById('preview-title').textContent    = data.title;
         document.getElementById('preview-subtitle').textContent = data.subtitle;
@@ -591,6 +519,16 @@ $__view->start('scripts');
         body.innerHTML = html;
     }
 
+    // Back to an empty preview, so totals from one report are never left
+    // sitting above another report or an error.
+    const EMPTY_PREVIEW = document.getElementById('preview-body').innerHTML;
+
+    function resetPreview() {
+        document.getElementById('preview-title').textContent    = 'Preview';
+        document.getElementById('preview-subtitle').textContent = 'Choose a report and press Preview.';
+        document.getElementById('preview-stats').hidden = true;
+    }
+
     async function runPreview(params, button) {
         LS.util.setBusy(button, true, 'Building…');
 
@@ -603,8 +541,13 @@ $__view->start('scripts');
             const response = await LS.http.post(BASE + '/reports/preview', params);
             renderPreview(response.data);
         } catch (error) {
+            resetPreview();
+            // Say what is missing ("Select a teacher for this report.") rather
+            // than the bare "Validation failed." the response leads with.
+            const messages = error.errors ? Object.values(error.errors).flat() : [];
             body.innerHTML = '<div class="alert alert-danger" style="margin:1rem">'
-                + LS.util.escape(error.message || 'Could not build this report.') + '</div>';
+                + LS.util.escape(messages.length ? messages.join(' ') : (error.message || 'Could not build this report.'))
+                + '</div>';
         } finally {
             LS.util.setBusy(button, false);
         }
@@ -661,213 +604,36 @@ $__view->start('scripts');
     }
 
     /* ==================================================================== *
-     *  Tab switching
-     * ==================================================================== */
-    const tabButtons = document.querySelectorAll('.rtabs__btn');
-    const panels = { quick: document.getElementById('quick-panel'), advanced: document.getElementById('advanced-panel') };
-
-    tabButtons.forEach((btn) => btn.addEventListener('click', function () {
-        activeTab = btn.dataset.tab;
-        tabButtons.forEach((b) => b.classList.toggle('is-active', b === btn));
-        Object.entries(panels).forEach(([name, panel]) => { panel.hidden = name !== activeTab; });
-    }));
-
-    /* ==================================================================== *
-     *  QUICK SUMMARY wizard
-     * ==================================================================== */
-    const qYear    = document.getElementById('q-year');
-    const qGrade   = document.getElementById('q-grade');
-    const qSection = document.getElementById('q-section');
-    const qFrom    = document.getElementById('q-from');
-    const qTo      = document.getElementById('q-to');
-    const qStudent = document.getElementById('q-student');
-    const qSummary = document.getElementById('q-summary');
-
-    let qPeriod = 'today';
-    let qScope  = 'section';
-
-    const pad = (n) => String(n).padStart(2, '0');
-    const fmt = (d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
-    const todayStr = fmt(new Date());
-
-    function periodRange() {
-        if (qPeriod === 'custom') {
-            return [qFrom.value || todayStr, qTo.value || todayStr];
-        }
-        if (qPeriod === 'today') {
-            return [todayStr, todayStr];
-        }
-        if (qPeriod === 'week') {
-            const d = new Date();
-            const back = (d.getDay() + 6) % 7;      // days since Monday
-            d.setDate(d.getDate() - back);
-            return [fmt(d), todayStr];
-        }
-        if (qPeriod === 'month') {
-            const d = new Date();
-            return [fmt(new Date(d.getFullYear(), d.getMonth(), 1)), todayStr];
-        }
-        if (qPeriod === 'sy') {
-            const opt = qYear.selectedOptions[0];
-            const start = opt ? opt.dataset.start : '';
-            const end   = opt ? opt.dataset.end : '';
-            if (!start) return [todayStr, todayStr];
-            // For the year in progress, count up to today; a past or future
-            // year uses its own full span.
-            const to = (todayStr >= start && todayStr <= end) ? todayStr : end;
-            return [start, to];
-        }
-        return [todayStr, todayStr];
-    }
-
-    const PERIOD_LABEL = { today: 'Today', week: 'This week', month: 'This month', sy: 'The school year', custom: 'Custom range' };
-
-    function updateSummary() {
-        const [from, to] = periodRange();
-        const yearLabel = qYear.selectedOptions[0] ? qYear.selectedOptions[0].textContent.trim() : '—';
-        let who;
-
-        if (qScope === 'student') {
-            who = qStudent.value
-                ? document.getElementById('q-student-chosen').textContent.replace(/^Selected:\s*/, '')
-                : 'a student (none picked yet)';
-        } else if (qSection.value) {
-            who = qSection.selectedOptions[0].textContent.trim();
-        } else {
-            who = 'every student';
-        }
-
-        const range = from === to ? from : from + ' → ' + to;
-        qSummary.innerHTML = 'Attendance of <strong>' + LS.util.escape(who) + '</strong> '
-            + 'in <strong>' + LS.util.escape(yearLabel) + '</strong>, '
-            + '<strong>' + LS.util.escape((PERIOD_LABEL[qPeriod] || '').toLowerCase()) + '</strong> '
-            + '<span class="text-xs">(' + LS.util.escape(range) + ')</span>.';
-    }
-
-    /* ---- period buttons ------------------------------------------------- */
-    document.getElementById('q-period').addEventListener('click', function (event) {
-        const btn = event.target.closest('[data-period]');
-        if (!btn) return;
-        qPeriod = btn.dataset.period;
-        this.querySelectorAll('.choice').forEach((c) => c.classList.toggle('is-active', c === btn));
-        document.querySelector('[data-field="q-custom"]').hidden = qPeriod !== 'custom';
-        updateSummary();
-    });
-
-    /* ---- scope buttons -------------------------------------------------- */
-    document.getElementById('q-scope').addEventListener('click', function (event) {
-        const btn = event.target.closest('[data-scope]');
-        if (!btn) return;
-        qScope = btn.dataset.scope;
-        this.querySelectorAll('.choice').forEach((c) => c.classList.toggle('is-active', c === btn));
-        document.querySelector('[data-field="q-section-scope"]').hidden = qScope !== 'section';
-        document.querySelector('[data-field="q-student-scope"]').hidden = qScope !== 'student';
-        updateSummary();
-    });
-
-    /* ---- section list follows year + grade ------------------------------ */
-    function syncQuickSections() {
-        const year = qYear.value, grade = qGrade.value;
-        Array.from(qSection.options).forEach((opt) => {
-            if (opt.value === '') return;
-            const okYear  = !year  || opt.dataset.year  === year;
-            const okGrade = !grade || opt.dataset.grade === grade;
-            opt.hidden = !(okYear && okGrade);
-        });
-        if (qSection.selectedOptions[0] && qSection.selectedOptions[0].hidden) qSection.value = '';
-    }
-
-    qYear.addEventListener('change', function () { syncQuickSections(); updateSummary(); });
-    qGrade.addEventListener('change', function () { syncQuickSections(); updateSummary(); });
-    qSection.addEventListener('change', updateSummary);
-    [qFrom, qTo].forEach((el) => el.addEventListener('change', updateSummary));
-
-    /* ---- student typeahead (quick) -------------------------------------- */
-    (function () {
-        const search  = document.getElementById('q-student-search');
-        const results = document.getElementById('q-student-results');
-        const label   = document.getElementById('q-student-chosen');
-
-        search.addEventListener('input', LS.util.debounce(async function () {
-            const query = search.value.trim();
-            if (query.length < 2) { results.hidden = true; return; }
-            try {
-                const response = await LS.http.get(BASE + '/reports/students/search', { q: query });
-                const rows = response.data.rows || [];
-                results.innerHTML = rows.length === 0
-                    ? '<div class="typeahead__empty">No match.</div>'
-                    : rows.map((row) =>
-                        '<button type="button" class="typeahead__item" data-id="' + row.student_id + '">'
-                        + '<span>' + LS.util.escape(row.name) + '</span>'
-                        + '<span class="text-xs text-muted mono">' + LS.util.escape(row.student_number)
-                        + ' · ' + LS.util.escape(row.section_code || '—') + '</span></button>').join('');
-                results.hidden = false;
-            } catch (error) { results.hidden = true; }
-        }, 300));
-
-        results.addEventListener('click', function (event) {
-            const item = event.target.closest('[data-id]');
-            if (!item) return;
-            qStudent.value = item.dataset.id;
-            label.textContent = 'Selected: ' + item.textContent.trim();
-            label.className = 'field-help text-success';
-            search.value = '';
-            results.hidden = true;
-            updateSummary();
-        });
-    })();
-
-    /* ---- quick params + run --------------------------------------------- */
-    function quickParams() {
-        const [from, to] = periodRange();
-        const params = { date_from: from, date_to: to };
-        if (qYear.value) params.school_year_id = qYear.value;
-
-        if (qScope === 'student') {
-            params.type = 'student';
-            params.student_id = qStudent.value;
-        } else {
-            params.type = 'student_summary';
-            if (qGrade.value)   params.grade_level_id = qGrade.value;
-            if (qSection.value) params.section_id = qSection.value;
-        }
-        return params;
-    }
-
-    document.getElementById('q-run').addEventListener('click', function () {
-        if (qScope === 'student' && !qStudent.value) {
-            qSummary.innerHTML = '<span class="text-danger">Pick a student first, or switch to “A section”.</span>';
-            return;
-        }
-        activeTab = 'quick';
-        runPreview(quickParams(), this);
-    });
-
-    const cardsBtn = document.getElementById('q-cards');
-    if (cardsBtn) {
-        cardsBtn.addEventListener('click', function () {
-            if (qScope === 'student' && !qStudent.value) {
-                qSummary.innerHTML = '<span class="text-danger">Pick a student first, or switch to “A section”.</span>';
-                return;
-            }
-            // The card booklet ignores the report "type" — it is always the
-            // per-student expansion — but quickParams() carries the same scope
-            // (year, grade, section or one student) the summary uses.
-            postDownload('/reports/student-cards', quickParams());
-        });
-    }
-
-    syncQuickSections();
-    updateSummary();
-
-    /* ==================================================================== *
-     *  ADVANCED builder
+     *  Tabs and report buttons
      * ==================================================================== */
     const form    = document.getElementById('report-form');
     const type    = document.getElementById('r-type');
-    const desc     = document.getElementById('r-type-desc');
+    const desc    = document.getElementById('r-type-desc');
     const grade   = document.getElementById('r-grade');
     const section = document.getElementById('r-section');
+
+    function chooseType(value) {
+        if (type.value !== value) {
+            resetPreview();
+            document.getElementById('preview-body').innerHTML = EMPTY_PREVIEW;
+        }
+        type.value = value;
+        form.querySelectorAll('[data-type]').forEach((b) => b.classList.toggle('is-active', b.dataset.type === value));
+        syncFields();
+    }
+
+    document.querySelectorAll('.rtabs__btn').forEach((btn) => btn.addEventListener('click', function () {
+        document.querySelectorAll('.rtabs__btn').forEach((b) => b.classList.toggle('is-active', b === btn));
+        document.querySelectorAll('[data-tab-panel]').forEach((panel) => {
+            panel.hidden = panel.dataset.tabPanel !== btn.dataset.tab;
+        });
+        chooseType(btn.dataset.first);
+    }));
+
+    form.addEventListener('click', function (event) {
+        const btn = event.target.closest('[data-type]');
+        if (btn) chooseType(btn.dataset.type);
+    });
 
     function syncFields() {
         const wanted = FIELDS[type.value] || [];
@@ -886,8 +652,32 @@ $__view->start('scripts');
         });
     }
 
-    type.addEventListener('change', syncFields);
-    syncFields();
+    /* ---- period shortcuts fill From / To -------------------------------- */
+    const pad = (n) => String(n).padStart(2, '0');
+    const fmt = (d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+
+    document.getElementById('r-periods').addEventListener('click', function (event) {
+        const btn = event.target.closest('[data-period]');
+        if (!btn) return;
+
+        const today = new Date();
+        let from = fmt(today), to = fmt(today);
+
+        if (btn.dataset.period === 'week') {
+            const d = new Date();
+            d.setDate(d.getDate() - (d.getDay() + 6) % 7);   // back to Monday
+            from = fmt(d);
+        } else if (btn.dataset.period === 'month') {
+            from = fmt(new Date(today.getFullYear(), today.getMonth(), 1));
+        } else if (btn.dataset.period === 'sy') {
+            // The year in progress counts up to today.
+            from = btn.dataset.start;
+            to   = to > btn.dataset.end ? btn.dataset.end : to;
+        }
+
+        document.getElementById('r-from').value = from;
+        document.getElementById('r-to').value   = to;
+    });
 
     function syncSections() {
         const gradeId = grade.value;
@@ -901,7 +691,9 @@ $__view->start('scripts');
     grade.addEventListener('change', syncSections);
 
     document.getElementById('r-reset').addEventListener('click', function () {
+        const current = type.value;
         form.reset();
+        type.value = current;
         const studentChosen  = document.getElementById('r-student');
         const studentLabel   = document.getElementById('r-student-chosen');
         const studentResults = document.getElementById('r-student-results');
@@ -915,7 +707,7 @@ $__view->start('scripts');
         syncFields();
     });
 
-    /* ---- student typeahead (advanced) ----------------------------------- */
+    /* ---- student typeahead ---------------------------------------------- */
     (function () {
         const search  = document.getElementById('r-student-search');
         const chosen  = document.getElementById('r-student');
@@ -952,27 +744,23 @@ $__view->start('scripts');
 
     form.addEventListener('submit', function (event) {
         event.preventDefault();
-        activeTab = 'advanced';
         runPreview(LS.util.formData(form), form.querySelector('[type=submit]'));
     });
 
-    /* ==================================================================== *
-     *  Export (reads whichever tab is active)
-     * ==================================================================== */
+    const cardsBtn = document.getElementById('r-cards');
+    if (cardsBtn) {
+        // The card booklet is always the per-student expansion; it takes the
+        // same scope (year, grade, section or one student) as the form.
+        cardsBtn.addEventListener('click', () => postDownload('/reports/student-cards', LS.util.formData(form)));
+    }
+
     document.getElementById('export-buttons').addEventListener('click', function (event) {
         const button = event.target.closest('[data-export]');
         if (!button) return;
-
-        if (activeTab === 'quick') {
-            if (qScope === 'student' && !qStudent.value) {
-                qSummary.innerHTML = '<span class="text-danger">Pick a student first, or switch to “A section”.</span>';
-                return;
-            }
-            runExport(quickParams(), button.dataset.export);
-        } else {
-            runExport(LS.util.formData(form), button.dataset.export);
-        }
+        runExport(LS.util.formData(form), button.dataset.export);
     });
+
+    chooseType(type.value);
 })();
 </script>
 <?php $__view->stop(); ?>

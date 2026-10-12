@@ -29,38 +29,82 @@ $typeDescriptions = [
     'section_summary' => 'Per-student totals for a section.',
 ];
 
-/** Group the picker so it reads as a short menu rather than a flat list. */
-$typeGroups = [
-    'Attendance' => ['daily', 'weekly', 'monthly', 'teacher', 'teacher_time_in'],
-    'By section' => ['section_daily', 'section_summary'],
+/**
+ * Two tabs: the students in your classes, and your own time-in. Each shows
+ * its reports as buttons and only the filters the chosen report uses.
+ */
+$tabs = [
+    'classes' => ['My classes', 'fa-clipboard-user', ['daily', 'weekly', 'monthly', 'section_daily', 'section_summary']],
+    'timein'  => ['My time-in', 'fa-fingerprint',    ['teacher_time_in', 'teacher']],
 ];
+
+$shortLabels = [
+    'daily'           => 'Daily',
+    'weekly'          => 'Weekly',
+    'monthly'         => 'Monthly',
+    'section_daily'   => 'Daily sheet',
+    'section_summary' => 'Section summary',
+    'teacher_time_in' => 'Time-in',
+    'teacher'         => 'Sessions',
+];
+
+foreach ($tabs as $key => [$label, $icon, $tabTypes]) {
+    $tabs[$key][2] = array_values(array_filter($tabTypes, fn ($t) => isset($types[$t])));
+
+    if ($tabs[$key][2] === []) {
+        unset($tabs[$key]);
+    }
+}
 ?>
 
 <?php $__view->include('partials.page-header', [
     'title'       => 'Reports',
-    'subtitle'    => 'Preview on screen, then export as PDF or Excel. Every report is scoped to your own classes.',
+    'subtitle'    => 'Pick a tab and a report, then Preview and export as PDF or Excel. Every report is scoped to your own classes.',
     'breadcrumbs' => [['Dashboard', '/teacher'], ['Reports', null]],
 ]); ?>
 
-<div class="grid" style="grid-template-columns:320px 1fr;align-items:start">
-    <div class="card">
-        <div class="card__header"><h2 class="card__title">Build a report</h2></div>
+<style nonce="<?= e(csp_nonce()) ?>">
+    .rtabs { display:flex; gap:.35rem; margin-bottom:1rem; background:var(--surface-alt); max-width:420px;
+             padding:.3rem; border-radius:var(--radius-md, 10px); }
+    .rtabs__btn { flex:1; border:0; background:transparent; cursor:pointer; padding:.55rem .6rem;
+                  border-radius:var(--radius-sm, 8px); font-weight:600; font-size:.85rem;
+                  color:var(--text-muted); display:flex; align-items:center; justify-content:center; gap:.4rem; }
+    .rtabs__btn.is-active { background:var(--surface, #fff); color:var(--text); box-shadow:var(--shadow-sm, 0 1px 2px rgba(0,0,0,.08)); }
+    .choice-grid { display:grid; grid-template-columns:repeat(2, 1fr); gap:.4rem; }
+    .choice { border:1px solid var(--border, #d9dee6); background:var(--surface, #fff);
+              border-radius:var(--radius-sm, 8px); padding:.6rem .5rem; cursor:pointer;
+              font-weight:600; font-size:.83rem; color:var(--text); text-align:center; }
+    .choice:hover { border-color:var(--primary, #1e5bd6); }
+    .choice.is-active { border-color:var(--primary, #1e5bd6); background:var(--primary-050, rgba(30,91,214,.08));
+                        color:var(--primary, #1e5bd6); }
+</style>
 
+<div class="rtabs" role="tablist">
+    <?php $first = true; foreach ($tabs as $key => [$label, $icon, $tabTypes]): ?>
+        <button type="button" class="rtabs__btn<?= $first ? ' is-active' : '' ?>" data-tab="<?= e($key) ?>"
+                data-first="<?= e($tabTypes[0]) ?>" role="tab">
+            <i class="fa-solid <?= e($icon) ?>"></i> <?= e($label) ?>
+        </button>
+    <?php $first = false; endforeach; ?>
+</div>
+
+<div class="grid" style="grid-template-columns:320px minmax(0, 1fr);align-items:start">
+    <div class="card">
         <div class="card__body">
             <form id="report-form">
+                <input type="hidden" name="type" id="r-type" value="<?= e(reset($tabs)[2][0]) ?>">
+
                 <div class="form-group">
-                    <label for="r-type" class="required">Report type</label>
-                    <select id="r-type" name="type" required>
-                        <?php foreach ($typeGroups as $groupLabel => $groupTypes): ?>
-                            <?php $visible = array_filter($groupTypes, fn ($t) => isset($types[$t])); ?>
-                            <?php if ($visible === []) { continue; } ?>
-                            <optgroup label="<?= e($groupLabel) ?>">
-                                <?php foreach ($visible as $value): ?>
-                                    <option value="<?= e($value) ?>"><?= e($types[$value]) ?></option>
-                                <?php endforeach; ?>
-                            </optgroup>
-                        <?php endforeach; ?>
-                    </select>
+                    <label>Report</label>
+                    <?php $first = true; foreach ($tabs as $key => [$label, $icon, $tabTypes]): ?>
+                        <div class="choice-grid" data-tab-panel="<?= e($key) ?>"<?= $first ? '' : ' hidden' ?>>
+                            <?php foreach ($tabTypes as $value): ?>
+                                <button type="button" class="choice" data-type="<?= e($value) ?>" title="<?= e($types[$value]) ?>">
+                                    <?= e($shortLabels[$value] ?? $types[$value]) ?>
+                                </button>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php $first = false; endforeach; ?>
                     <span class="field-help" id="r-type-desc"></span>
                 </div>
 
@@ -120,7 +164,7 @@ $typeGroups = [
         <div class="card__header">
             <div>
                 <h2 class="card__title" id="preview-title">Preview</h2>
-                <div class="text-xs text-muted" id="preview-subtitle">Choose a report type and press Preview.</div>
+                <div class="text-xs text-muted" id="preview-subtitle">Choose a report and press Preview.</div>
             </div>
             <div class="flex gap-1" id="export-buttons">
                 <button class="btn btn-secondary btn-sm" data-export="pdf"><i class="fa-solid fa-file-pdf"></i> PDF</button>
@@ -191,11 +235,46 @@ $__view->start('scripts');
         });
     }
 
-    type.addEventListener('change', syncFields);
-    syncFields();
+    const EMPTY_PREVIEW = document.getElementById('preview-body').innerHTML;
+
+    // Back to an empty preview, so totals from one report are never left
+    // sitting above another report or an error.
+    function resetPreview() {
+        document.getElementById('preview-title').textContent    = 'Preview';
+        document.getElementById('preview-subtitle').textContent = 'Choose a report and press Preview.';
+        const stats = document.getElementById('preview-stats');
+        if (stats) stats.hidden = true;
+    }
+
+    function chooseType(value) {
+        if (type.value !== value) {
+            resetPreview();
+            document.getElementById('preview-body').innerHTML = EMPTY_PREVIEW;
+        }
+        type.value = value;
+        form.querySelectorAll('[data-type]').forEach((b) => b.classList.toggle('is-active', b.dataset.type === value));
+        syncFields();
+    }
+
+    document.querySelectorAll('.rtabs__btn').forEach((btn) => btn.addEventListener('click', function () {
+        document.querySelectorAll('.rtabs__btn').forEach((b) => b.classList.toggle('is-active', b === btn));
+        document.querySelectorAll('[data-tab-panel]').forEach((panel) => {
+            panel.hidden = panel.dataset.tabPanel !== btn.dataset.tab;
+        });
+        chooseType(btn.dataset.first);
+    }));
+
+    form.addEventListener('click', function (event) {
+        const btn = event.target.closest('[data-type]');
+        if (btn) chooseType(btn.dataset.type);
+    });
+
+    chooseType(type.value);
 
     document.getElementById('r-reset').addEventListener('click', function () {
+        const current = type.value;
         form.reset();
+        type.value = current;
         syncFields();
     });
 
@@ -215,8 +294,12 @@ $__view->start('scripts');
             const response = await LS.http.post('/teacher/reports/preview', filters);
             render(response.data);
         } catch (error) {
+            resetPreview();
+            // Say what is missing rather than the bare "Validation failed.".
+            const messages = error.errors ? Object.values(error.errors).flat() : [];
             body.innerHTML = '<div class="alert alert-danger" style="margin:1rem">'
-                + LS.util.escape(error.message || 'Could not build this report.') + '</div>';
+                + LS.util.escape(messages.length ? messages.join(' ') : (error.message || 'Could not build this report.'))
+                + '</div>';
         } finally {
             LS.util.setBusy(button, false);
         }
