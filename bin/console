@@ -165,6 +165,7 @@ try {
         'device:unblock'      => commandDeviceUnblock($arguments, $flags),
         'fingerprint:reset'   => commandFingerprintReset($flags),
         'students:sample'     => commandSampleStudents($flags),
+        'data:load'           => commandDataLoad($arguments, $flags),
         'rfid:release'        => commandRfidRelease($flags),
         default               => commandHelp(),
     };
@@ -197,6 +198,7 @@ function commandHelp(): void
     out('    fingerprint:reset       Erase every enrolment and every sensor, to start over');
     out('    rfid:release            Free cards held by students who have left, for re-issue');
     out('    students:sample         Enrol sample students (--section=G3-S1 --count=10)');
+    out('    data:load <file.json>   Load sections, teachers, students and timetables (--check to only test)');
     out('');
     out('  Operations', 'cyan');
     out('    worker [--once]         Maintenance loop: sessions, heartbeats, retention');
@@ -1946,6 +1948,80 @@ function commandCreateAdmin(): void
  *
  * @param list<string> $flags
  */
+/**
+ * Load a school's starting data from a JSON file (see App\Services\SchoolDataLoader
+ * for the layout). One transaction: either the whole file goes in, or nothing.
+ *
+ * --check runs every row through the same rules and then rolls back, so a file
+ * can be tried before it is loaded for real.
+ *
+ * @param list<string> $arguments
+ * @param list<string> $flags
+ */
+function commandDataLoad(array $arguments, array $flags): void
+{
+    $file  = array_values(array_filter($arguments, static fn (string $a): bool => !str_starts_with($a, '--')))[0] ?? '';
+    $check = in_array('--check', $flags, true);
+
+    heading($check ? 'Check a data file (nothing is saved)' : 'Load school data');
+
+    if ($file === '' || !is_file($file)) {
+        fail('Give the data file: console.bat data:load "C:\\path\\to\\file.json"');
+    }
+
+    try {
+        $data = json_decode((string) file_get_contents($file), true, 64, JSON_THROW_ON_ERROR);
+    } catch (JsonException $e) {
+        fail('That file is not valid JSON: ' . $e->getMessage());
+    }
+
+    $db    = Database::instance();
+    $admin = (int) ($db->scalar(
+        "SELECT u.user_id FROM users u JOIN roles r ON r.role_id = u.role_id
+          WHERE r.role_slug = 'administrator' AND u.deleted_at IS NULL ORDER BY u.user_id LIMIT 1"
+    ) ?? 0);
+
+    if ($admin === 0) {
+        fail('Create the administrator account first: console.bat user:create-admin');
+    }
+
+    SettingsService::hydrate();
+    $result = (new App\Services\SchoolDataLoader($admin))->load((array) $data, $check);
+
+    foreach ($result['counts'] as $what => $count) {
+        ok(sprintf('%-12s %d', $what, $count));
+    }
+
+    if ($result['counts'] === []) {
+        out('  Nothing new: everything in the file already exists.', 'grey');
+    }
+
+    out('');
+
+    if ($check) {
+        ok('Every row passed. Nothing was saved; run again without --check to load it.');
+        out('');
+
+        return;
+    }
+
+    if ($result['accounts'] !== []) {
+        out('  Teacher logins - give each teacher theirs. Each must choose a new', 'bold');
+        out('  password at first sign-in. These are shown only now; copy them.', 'bold');
+        out('');
+
+        foreach ($result['accounts'] as $account) {
+            out(sprintf('    %-28s %-14s %s', $account['name'], $account['username'], $account['password']), 'cyan');
+        }
+
+        out('');
+    }
+
+    out('  Next: register a terminal for each classroom (Devices page), and enrol', 'grey');
+    out('  each teacher\'s fingerprint, before the first session can open.', 'grey');
+    out('');
+}
+
 function commandCreateTeacherAccounts(array $flags): void
 {
     $db = Database::instance();
