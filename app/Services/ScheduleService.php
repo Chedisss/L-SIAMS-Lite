@@ -30,7 +30,7 @@ final class ScheduleService
      * @return array{warnings:list<string>}
      * @throws ValidationException
      */
-    public static function validate(array $data, ?int $ignoreScheduleId = null, bool $allowOverride = false): array
+    public static function validate(array $data, ?int $ignoreScheduleId = null, bool $allowOverride = false, bool $requireTerminal = true): array
     {
         $db       = Database::instance();
         $warnings = [];
@@ -142,7 +142,10 @@ final class ScheduleService
             ['classroom' => $classroomId]
         );
 
-        if ($device === null) {
+        // $requireTerminal is false only for a bulk load of a timetable before
+        // the terminals are registered (data:load). The schedule exists but no
+        // session can open in the room until a terminal is assigned to it.
+        if ($device === null && $requireTerminal) {
             // Telling somebody to register a device they have already
             // registered sends them round the same loop; the usual mistake is
             // a terminal saved with Classroom left on Unassigned.
@@ -415,9 +418,9 @@ final class ScheduleService
     }
 
     /** @param array<string,mixed> $data */
-    public static function create(array $data, int $userId, bool $allowOverride = false): int
+    public static function create(array $data, int $userId, bool $allowOverride = false, bool $requireTerminal = true): int
     {
-        $result = self::validate($data, null, $allowOverride);
+        $result = self::validate($data, null, $allowOverride, $requireTerminal);
 
         $db = Database::instance();
 
