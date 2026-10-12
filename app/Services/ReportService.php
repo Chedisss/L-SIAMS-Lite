@@ -27,7 +27,7 @@ final class ReportService
         'monthly'               => 'Monthly Attendance',
         'student'               => 'Student Attendance',
         'teacher'               => 'Teacher Attendance',
-        'teacher_time_in'       => 'Teacher Time-In',
+        'teacher_time_in'       => 'Teacher Time In & Out',
         'subject'               => 'Subject Attendance',
         'section_daily'         => 'Section Daily Attendance Sheet',
         'section_summary'       => 'Section Attendance Summary',
@@ -635,7 +635,7 @@ final class ReportService
 
 
     /**
-     * Teacher Time-In — one row per session: when the class was scheduled to
+     * Teacher Time In & Out — one row per session: when the class was scheduled to
      * start, when the teacher actually opened it, and when it was closed.
      *
      * "Time in" is the fingerprint scan that opened the class. A session
@@ -710,13 +710,11 @@ final class ReportService
                 ? null
                 : intdiv(Clock::parse((string) $r['closed_at'])->getTimestamp() - $in->getTimestamp(), 60);
 
+            // The times come straight after the teacher, so Time In and Time
+            // Out are both on screen without scrolling the preview sideways.
             $out[] = [
                 self::humanDate((string) $r['session_date']),
                 trim($r['last_name'] . ', ' . $r['first_name']),
-                $r['employee_number'],
-                $r['subject_name'],
-                $r['section_code'],
-                $r['room_number'],
                 $scheduled->format('g:i A'),
                 $in->format('g:i A'),
                 $inStatus,
@@ -726,9 +724,13 @@ final class ReportService
                     default                           => self::humanTime($r['closed_at']),
                 },
                 $duration === null ? '—' : $duration . ' min',
+                $r['subject_name'],
+                $r['section_code'],
+                $r['room_number'],
                 $r['opened_method'] === 'password'
                     ? 'Password' . ($r['opened_by_username'] ? ': ' . $r['opened_by_username'] : '')
                     : 'Fingerprint',
+                $r['employee_number'],
             ];
         }
 
@@ -740,10 +742,10 @@ final class ReportService
         }
 
         return [
-            'title'    => 'Teacher Time-In Report',
+            'title'    => 'Teacher Time In & Out Report',
             'subtitle' => $teacherName !== '' ? $teacherName : 'All teachers',
-            'headers'  => ['Date', 'Teacher', 'Emp. No.', 'Subject', 'Section', 'Room', 'Scheduled In', 'Time In',
-                           'In Status', 'Time Out', 'Duration', 'Opened By'],
+            'headers'  => ['Date', 'Teacher', 'Scheduled In', 'Time In', 'In Status', 'Time Out', 'Duration',
+                           'Subject', 'Section', 'Room', 'Opened By', 'Emp. No.'],
             'rows'       => $out,
             'statistics' => [
                 'Sessions held'    => count($rows) - $aborted,
