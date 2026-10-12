@@ -515,7 +515,8 @@ $rotateDays = (int) config('security.api_key.age_rotate_days', 365);
             <div class="card__body">
                 <p class="text-xs text-muted mb-2">
                     A disabled terminal is rejected at authentication — before any attendance logic runs.
-                    Devices are never deleted; their logs and the attendance they carried remain.
+                    Remove takes a terminal off the list and frees its room and MAC address, so the board
+                    can be registered again; its logs and the attendance it carried remain.
                 </p>
 
                 <div class="flex flex-col gap-1">
@@ -539,6 +540,10 @@ $rotateDays = (int) config('security.api_key.age_rotate_days', 365);
                         ?>
                         <button class="btn <?= e($class) ?> btn-sm" data-status="<?= e($status) ?>"><?= e($label) ?></button>
                     <?php endforeach; ?>
+
+                    <button class="btn btn-danger btn-sm" id="remove-device">
+                        <i class="fa-solid fa-trash"></i> Remove terminal
+                    </button>
 
                     <?php if ($device['claim_status'] !== 'claimed'): ?>
                         <p class="text-xs text-muted">
@@ -982,6 +987,34 @@ $__view->start('scripts');
                 LS.util.setBusy(this, false);
             }
         });
+    });
+
+    /* ---- remove ------------------------------------------------------------- */
+    document.getElementById('remove-device').addEventListener('click', async function () {
+        const confirmed = await LS.modal.confirm({
+            title:   'Remove this terminal?',
+            message: 'It disappears from the list, its key stops working, and its room and MAC address '
+                     + 'are freed so you can register it again. Attendance it already recorded is kept.',
+            confirmLabel:    'Remove terminal',
+            danger:          true,
+            requirePassword: true,
+        });
+
+        if (!confirmed) return;
+
+        LS.util.setBusy(this, true, 'Removing…');
+
+        try {
+            const response = await LS.http.post('/admin/devices/' + ID + '/remove', {
+                reason: 'Removed from the device detail page.',
+                confirm_password: confirmed.password || undefined,
+            });
+            LS.toast.success(response.message);
+            setTimeout(() => { window.location.href = '/admin/devices'; }, 800);
+        } catch (error) {
+            LS.toast.fromError(error);
+            LS.util.setBusy(this, false);
+        }
     });
 
     /* ---- credential display -------------------------------------------------- */

@@ -202,6 +202,15 @@ final class DeviceController extends Controller
             $update['mac_address'] = NetworkService::normaliseMac((string) $data['mac_address']);
         }
 
+        // A room holds one live terminal per role. Without this check a move
+        // into an occupied room reached the database's unique index and came
+        // back as a raw constraint error instead of naming the terminal there.
+        $liveStatuses = ['pending', 'active', 'offline', 'suspended'];
+
+        if ($update['classroom_id'] !== null && in_array((string) $existing['status'], $liveStatuses, true)) {
+            DeviceService::assertClassroomSlotFree((int) $update['classroom_id'], $update['device_role'], $deviceRowId);
+        }
+
         $db->update('devices', $update, ['id' => $deviceRowId]);
 
         AuditService::logChange(
@@ -320,6 +329,20 @@ final class DeviceController extends Controller
         DeviceService::setStatus($request->routeInt('id'), $status, $reason, $this->requireUserId());
 
         return $this->json([], sprintf('Device set to %s.', $status));
+    }
+
+    /** Remove a terminal from the list; its history stays (DeviceService::remove). */
+    public function remove(Request $request): Response
+    {
+        $this->requirePasswordConfirmation($request);
+
+        DeviceService::remove(
+            $request->routeInt('id'),
+            $request->string('reason', 'Removed by administrator.'),
+            $this->requireUserId()
+        );
+
+        return $this->json([], 'Terminal removed.');
     }
 
     /**

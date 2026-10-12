@@ -173,9 +173,9 @@ final class DeviceService
         });
     }
 
-    private static function assertClassroomSlotFree(int $classroomId, string $role, ?int $ignoreDeviceRowId): void
+    public static function assertClassroomSlotFree(int $classroomId, string $role, ?int $ignoreDeviceRowId): void
     {
-        $sql = "SELECT device_id FROM devices
+        $sql = "SELECT device_id || ' - ' || device_name FROM devices
                  WHERE classroom_id = :classroom
                    AND deleted_at IS NULL
                    AND status IN ('pending','active','offline','suspended')
@@ -192,7 +192,8 @@ final class DeviceService
 
         if ($existing !== null) {
             throw new ValidationException(['classroom_id' => [sprintf(
-                'This classroom already has an active terminal (%s) covering the %s role.',
+                'This classroom already has a terminal (%s) covering the %s role. Move that terminal '
+                . 'to another room, or remove it, first.',
                 $existing,
                 $role
             )]]);
@@ -1074,6 +1075,67 @@ final class DeviceService
             'success',
             $userId
         );
+    }
+
+    /**
+     * Remove a terminal: take it off the list and free what it held, so the
+     * same board or the same classroom can be registered again.
+     *
+     * The row stays (soft delete), because attendance sessions, logs and
+     * fingerprint records point at it and must keep doing so. What it held is
+     * released: its keys are revoked, it leaves its classroom slot, and its MAC
+     * is rewritten to a RETIRED- marker - the same release a confirmed MAC
+     * reuse performs - so registering that board again is not refused.
+     */
+    public static function remove(int $deviceRowId, string $reason, ?int $userId = null): void
+    {
+        $db     = Database::instance();
+        $device = $db->selectOne('SELECT * FROM devices WHERE id = :id AND deleted_at IS NULL', ['id' => $deviceRowId]);
+
+        if ($device === null) {
+            throw new ValidationException(['device' => ['Device not found.']]);
+        }
+
+        $openSession = $db->scalar(
+            "SELECT session_id FROM attendance_sessions WHERE device_row_id = :id AND status = 'open'",
+            ['id' => $deviceRowId]
+        );
+
+        if ($openSession !== null) {
+            throw new ValidationException([
+                'device' => ['This terminal has an attendance session open right now. Close it first.'],
+            ]);
+        }
+
+        $db->transaction(static function (Database $db) use ($device, $deviceRowId, $reason, $userId): void {
+            $keys = $db->select(
+                "SELECT api_key_id FROM api_keys WHERE device_row_id = :id AND status IN ('active','rotating')",
+                ['id' => $deviceRowId]
+            );
+
+            foreach ($keys as $key) {
+                ApiKeyService::revoke((int) $key['api_key_id'], 'Device removed: ' . $reason, $userId);
+            }
+
+            $db->update('devices', [
+                'status'      => 'decommissioned',
+                'mac_address' => 'RETIRED-' . substr(Crypto::randomHex(6), 0, 11),
+                'deleted_at'  => Clock::nowString(),
+                'updated_at'  => Clock::nowString(),
+            ], ['id' => $deviceRowId]);
+
+            AuditService::log(
+                AuditService::DEVICE_DECOMMISSIONED,
+                'devices',
+                'device',
+                $deviceRowId,
+                ['status' => $device['status'], 'mac_address' => $device['mac_address']],
+                ['status' => 'decommissioned', 'removed' => true, 'reason' => $reason],
+                sprintf('Terminal %s (%s) removed. %s', $device['device_id'], $device['device_name'], $reason),
+                'success',
+                $userId
+            );
+        });
     }
 
     /**

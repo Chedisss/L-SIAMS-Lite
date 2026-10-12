@@ -206,6 +206,7 @@ $router->group('/admin', $adminChain, static function ($router): void {
     $router->get('/devices/{id:\d+}/key-history', DeviceController::class . '@keyHistory');
     $router->post('/devices/{id:\d+}/provisioning-file', DeviceController::class . '@provisioningFile');
     $router->post('/devices/{id:\d+}/status', DeviceController::class . '@setStatus');
+    $router->post('/devices/{id:\d+}/remove', DeviceController::class . '@remove');
     $router->post('/devices/{id:\d+}/test', DeviceController::class . '@testConnection');
 
     // --- Attendance ---
