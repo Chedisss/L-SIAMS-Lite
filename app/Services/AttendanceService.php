@@ -363,10 +363,23 @@ final class AttendanceService
         ) ?? [];
 
         return match ($intent) {
-            self::INTENT_TIME_IN  => self::recordTimeIn($db, $session, $schedule, $device, $card, $cardUid, $requestId, $now),
+            self::INTENT_TIME_IN  => self::recordTimeIn($db, $session, $schedule, $device, $card, $cardUid, $requestId, $now, $record),
             self::INTENT_TIME_OUT => self::recordTimeOut($db, $session, $schedule, $device, $card, $record ?? [], $cardUid, $now),
             default               => self::rejectComplete($db, $session, $card, $deviceRowId, $cardUid, $record ?? []),
         };
+    }
+
+    /**
+     * True for the row written for a student who had not tapped in when the
+     * session closed: absent, and never timed in.
+     *
+     * @param array<string,mixed>|null $record
+     */
+    private static function isAbsentPlaceholder(?array $record): bool
+    {
+        return $record !== null
+            && $record['time_in'] === null
+            && (string) $record['arrival_status'] === AttendanceStatusResolver::ARRIVAL_ABSENT;
     }
 
     /**
@@ -384,6 +397,13 @@ final class AttendanceService
     private static function resolveIntent(?array $record, array $device, ?string $forcedIntent): string
     {
         $role = (string) ($device['device_role'] ?? 'both');
+
+        // An absence written when the class was closed early is not a visit.
+        // If the teacher reopens the class, that student must still be able to
+        // tap in, so the placeholder counts as "no record yet".
+        if (self::isAbsentPlaceholder($record)) {
+            $record = null;
+        }
 
         if ($role === 'entry') {
             return $record === null ? self::INTENT_TIME_IN : self::INTENT_COMPLETE;
@@ -437,7 +457,8 @@ final class AttendanceService
         array $card,
         string $cardUid,
         ?string $requestId,
-        DateTimeImmutable $now
+        DateTimeImmutable $now,
+        ?array $existing = null
     ): array {
         $sessionId = (int) $session['session_id'];
         $studentId = (int) $card['student_id'];
@@ -488,7 +509,7 @@ final class AttendanceService
             AttendanceStatusResolver::DEPARTURE_PENDING
         );
 
-        $attendanceId = (int) $db->insert('attendance_records', [
+        $row = [
             'session_id'     => $sessionId,
             'student_id'     => $studentId,
             // Denormalised at write time, permanently (Part 15.4).
@@ -508,7 +529,23 @@ final class AttendanceService
             'request_id'        => $requestId,
             'created_at'        => Clock::nowString(),
             'updated_at'        => Clock::nowString(),
-        ]);
+        ];
+
+        if (self::isAbsentPlaceholder($existing)) {
+            // The class was closed early and reopened: turn the absence into
+            // this arrival, in place, so the student still has one row. The
+            // card and request id were never written, so they may be now
+            // (migration 037); created_at stays as the close wrote it.
+            unset($row['created_at']);
+            $attendanceId = (int) $existing['attendance_id'];
+            $db->update('attendance_records', $row + [
+                'time_out'                => null,
+                'auto_generated_time_out' => 0,
+                'duration_minutes'        => null,
+            ], ['attendance_id' => $attendanceId]);
+        } else {
+            $attendanceId = (int) $db->insert('attendance_records', $row);
+        }
 
         $counters = self::updateSessionCounters($db, $sessionId);
 

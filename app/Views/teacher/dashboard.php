@@ -356,6 +356,11 @@ $__view->start('scripts');
 (function () {
     const LS = window.LSIAMS;
 
+    // The "Current class" card shows one session. Events from any other session
+    // of this teacher must not overwrite its counters.
+    const currentSession = <?= json_encode($current !== null ? (string) $current['session_code'] : null) ?>;
+    const isCurrent = (data) => currentSession !== null && data && data.session_id === currentSession;
+
     // Per-tap sounds and their mute toggle now live in tap-sound.js, which the
     // layout loads for every teacher page and binds to these same realtime
     // events — so the chimes play wherever the teacher is, not only here. This
@@ -392,11 +397,11 @@ $__view->start('scripts');
     if (LS.realtime) {
         LS.realtime
             .on('attendance.time_in', (data) => {
-                updateCounters(data.counters);
+                if (isCurrent(data)) updateCounters(data.counters);
                 LS.toast.success(data.student.name + ' — ' + data.final_status, 'Tapped in');
             })
             .on('attendance.time_out', (data) => {
-                updateCounters(data.counters);
+                if (isCurrent(data)) updateCounters(data.counters);
             })
             .on('attendance.rejected', (data) => {
                 if (data.code === 'SECTION_MISMATCH') {

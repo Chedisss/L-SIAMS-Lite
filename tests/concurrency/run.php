@@ -649,6 +649,72 @@ try {
     /* =====================================================================
      * 8. Idempotency (Part 17.3)
      * ===================================================================== */
+    if ($want('reopen')) {
+        $runner->group('7b. A class closed early and reopened still admits the absent');
+
+        $fixture->build(1, 3, 1);
+        $device  = $fixture->device(0);
+        $session = AttendanceSessionService::open($device, $fixture->teacher(), $fixture->schedule(0), 0);
+        $cards   = $fixture->ids['cards'][$fixture->ids['sections'][0]];
+
+        AttendanceService::tap($device, $cards[0], null, null);
+        AttendanceSessionService::close((int) $session['session_id'], 'teacher', null);
+
+        $absent = (int) $db->scalar(
+            "SELECT COUNT(*) FROM attendance_records WHERE session_id = :s AND final_status = 'Absent'",
+            ['s' => $session['session_id']]
+        );
+        $runner->assertEquals('closing early marks the two who never tapped Absent', 2, $absent);
+
+        $reopened = AttendanceSessionService::open($device, $fixture->teacher(), $fixture->schedule(0), 0);
+        $runner->assertEquals('reopening continues the same session',
+            (int) $session['session_id'], (int) $reopened['session_id']);
+
+        $code = null;
+        try {
+            $code = AttendanceService::tap($device, $cards[1], null, null)['code'] ?? null;
+        } catch (BusinessRuleException $e) {
+            $code = $e->errorCode();
+        }
+        $runner->assertEquals('a student marked Absent can still tap in', 'TIME_IN_RECORDED', $code);
+
+        $rows = $db->select(
+            'SELECT time_in, arrival_status FROM attendance_records WHERE session_id = :s AND student_id = :st',
+            ['s' => $session['session_id'], 'st' => $fixture->ids['students'][$fixture->ids['sections'][0]][1]]
+        );
+        $runner->assertEquals('the absence becomes the arrival, in the same row', 1, count($rows));
+        $runner->assertEquals('and it now has a time in', true, ($rows[0]['time_in'] ?? null) !== null);
+        $runner->assertEquals('and is no longer absent', true, ($rows[0]['arrival_status'] ?? '') !== 'absent');
+
+        $again = null;
+        try {
+            AttendanceService::tap($device, $cards[0], null, null);
+        } catch (BusinessRuleException $e) {
+            $again = $e->errorCode();
+        }
+        $runner->assertEquals('a student who did tap in is not given a second time in', true, $again !== null && $again !== 'TIME_IN_RECORDED');
+
+        // The other absentee arrives while the terminal is offline. Its queued
+        // tap, replayed twice, must land once and be recognised the second time.
+        $queued = [[
+            'uid'        => $cards[2],
+            'timestamp'  => Clock::now()->format('Y-m-d H:i:s'),
+            'request_id' => '7d1f3c2a-5b4e-4c6d-9e8f-0a1b2c3d4e5f',
+        ]];
+        $firstSync  = \App\Services\DeviceService::syncQueue($device, $queued);
+        $secondSync = \App\Services\DeviceService::syncQueue($device, $queued);
+        $runner->assertEquals('a queued tap from an absentee is accepted', 1, $firstSync['accepted']);
+        $runner->assertEquals('and its replay is a duplicate, not a time-out', 1, $secondSync['duplicate']);
+
+        $synced = $db->selectOne(
+            'SELECT request_id, rfid_uid, synced_offline FROM attendance_records WHERE session_id = :s AND student_id = :st',
+            ['s' => $session['session_id'], 'st' => $fixture->ids['students'][$fixture->ids['sections'][0]][2]]
+        ) ?? [];
+        $runner->assertEquals('the arrival keeps its request id', '7d1f3c2a-5b4e-4c6d-9e8f-0a1b2c3d4e5f', $synced['request_id'] ?? null);
+        $runner->assertEquals('and its card', $cards[2], $synced['rfid_uid'] ?? null);
+        $runner->assertEquals('and is marked as synced from offline', 1, (int) ($synced['synced_offline'] ?? 0));
+    }
+
     if ($want('idempotency')) {
         $runner->group('8. Idempotent retries land exactly once');
 
