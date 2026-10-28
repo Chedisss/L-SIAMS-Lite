@@ -156,6 +156,7 @@ try {
         'db:import'           => commandDbImport($arguments, $flags),
         'db:import-mysql'     => commandDbImportMysql($arguments, $flags),
         'backup:decrypt'      => commandBackupDecrypt($arguments),
+        'backup:reindex'      => commandBackupReindex(),
         'time:shift'          => commandTimeShift($arguments, $flags),
         'schema:dump'         => commandSchemaDump(),
         'user:create-admin'   => commandCreateAdmin(),
@@ -801,6 +802,46 @@ function commandBackup(): void
     out('  also decrypts the fingerprint templates and the terminals\' HMAC', 'grey');
     out('  secrets, so a database restored beside a NEW key loses all three.', 'grey');
     out('  Moving to another PC? See docs/MOVING-TO-ANOTHER-PC.md', 'grey');
+}
+
+/**
+ * Repair backup rows whose recorded checksum no longer matches their file.
+ *
+ * The old filename used second resolution, so two backups taken in the same
+ * second — the shape a restore storm produces, since every restore also takes
+ * a safety backup — shared a name and one overwrote the other on disk. The
+ * surviving file is a sound backup, but the overwritten row still carried its
+ * own checksum and so failed verification and refused to restore. This walks
+ * every archive, and where the file decrypts (AES-256-GCM authenticates it, so
+ * a genuinely corrupt file cannot slip through) and parses as a real dump, it
+ * rewrites the stored checksum, size and table count to match the file. Rows
+ * whose file is missing or will not decrypt are reported and left untouched.
+ */
+function commandBackupReindex(): void
+{
+    heading('Re-indexing backups (repairing drifted checksums)');
+
+    $summary = BackupService::reindex();
+
+    foreach ($summary['details'] as $line) {
+        $colour = str_contains($line['result'], 'NOT repaired') || str_contains($line['result'], 'missing')
+            ? 'yellow'
+            : (str_contains($line['result'], 're-derived') ? 'green' : 'grey');
+        out(sprintf('  #%d  %s  — %s', $line['backup_id'], $line['name'], $line['result']), $colour);
+    }
+
+    out('');
+    ok(sprintf('%d repaired, %d already OK, %d unreadable, %d corrupt.',
+        $summary['repaired'], $summary['already_ok'], $summary['unreadable'], $summary['corrupt']));
+
+    if ($summary['repaired'] > 0) {
+        out('  Those backups now verify and can be restored. Press Verify on the', 'grey');
+        out('  Backup & Restore page to confirm.', 'grey');
+    }
+
+    if ($summary['corrupt'] > 0) {
+        out('  The corrupt archives were left as they are — do not rely on them.', 'yellow');
+    }
 }
 
 /**

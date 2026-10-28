@@ -39,7 +39,29 @@ final class BackupService
             @mkdir($directory, 0750, true);
         }
 
-        $name     = sprintf('lsiams-%s-%s', $triggerType, Clock::now()->format('Ymd-His'));
+        $name = sprintf('lsiams-%s-%s', $triggerType, Clock::now()->format('Ymd-His'));
+
+        // The row is inserted first, with no file yet, so its auto-assigned id
+        // can go into the filename below. Two backups taken in the same second
+        // used to build the same name — Ymd-His has only second resolution — so
+        // the second file_put_contents() silently overwrote the first file while
+        // both rows kept their own checksum. The earlier row then described
+        // bytes that no longer existed and failed verification for ever after,
+        // even though its data was a perfectly good backup. A restore storm,
+        // where every attempt also takes a safety backup, produces exactly that
+        // collision several times over. The id is unique by construction, so a
+        // filename carrying it cannot clash however many land in one second.
+        $backupId = (int) Database::instance()->insert('backups', [
+            'backup_name'  => $name,
+            'file_path'    => '',
+            'trigger_type' => $triggerType,
+            'status'       => 'running',
+            'is_encrypted' => 1,
+            'is_compressed' => 1,
+            'created_by'   => $userId,
+            'created_at'   => Clock::nowString(),
+        ]);
+
         // Not '.enc'. Windows hands that extension to whichever program
         // claimed it — commonly Wireshark — so a school's backup arrived
         // looking like a packet capture, with an icon that invited somebody to
@@ -51,19 +73,10 @@ final class BackupService
         // APP_KEY. Only the name it is written under is different, and
         // backup:decrypt still accepts both so every existing '.sql.gz.enc'
         // archive keeps working.
-        $filename = $name . '.sql.gz.lsiams';
+        $filename = sprintf('%s-%d.sql.gz.lsiams', $name, $backupId);
         $path     = $directory . '/' . $filename;
 
-        $backupId = (int) Database::instance()->insert('backups', [
-            'backup_name'  => $name,
-            'file_path'    => $filename,
-            'trigger_type' => $triggerType,
-            'status'       => 'running',
-            'is_encrypted' => 1,
-            'is_compressed' => 1,
-            'created_by'   => $userId,
-            'created_at'   => Clock::nowString(),
-        ]);
+        Database::instance()->update('backups', ['file_path' => $filename], ['backup_id' => $backupId]);
 
         try {
             $dump   = self::dump($tableCount);
@@ -381,6 +394,95 @@ final class BackupService
                 ? 'Backup verified: checksum matches, archive decrypts, and the dump is well formed.'
                 : 'Verification failed. Do not rely on this backup.',
         ];
+    }
+
+    /**
+     * Re-derive the recorded checksum, size and table count of every backup
+     * from the file actually on disk.
+     *
+     * This repairs rows whose checksum drifted away from their file — the
+     * damage the same-second filename collision used to cause, where one
+     * archive overwrote another and the earlier row was left describing bytes
+     * that no longer existed. A row like that fails verification and cannot be
+     * restored, even though the file sitting in its place is a sound backup.
+     *
+     * It is deliberately conservative. A row's checksum is only rewritten when
+     * the file DECRYPTS (AES-256-GCM authenticates the whole archive, so a
+     * corrupted or truncated file cannot pass this) AND parses as a well-formed
+     * SQLite dump. A file that fails either test is left exactly as it is and
+     * reported, never papered over — the point is to make the bookkeeping tell
+     * the truth about the files, not to force everything green.
+     *
+     * @return array{repaired:int,already_ok:int,unreadable:int,corrupt:int,
+     *               details:list<array{backup_id:int,name:string,result:string}>}
+     */
+    public static function reindex(): array
+    {
+        $directory = (string) Config::get('app.paths.backups');
+
+        $rows = Database::instance()->select(
+            "SELECT backup_id, backup_name, file_path, checksum
+               FROM backups
+              WHERE status IN ('completed', 'verified', 'restored')
+              ORDER BY backup_id"
+        );
+
+        $summary = ['repaired' => 0, 'already_ok' => 0, 'unreadable' => 0, 'corrupt' => 0, 'details' => []];
+
+        foreach ($rows as $row) {
+            $id   = (int) $row['backup_id'];
+            $name = (string) $row['backup_name'];
+            $path = $directory . '/' . (string) $row['file_path'];
+
+            $note = static function (string $result) use (&$summary, $id, $name): void {
+                $summary['details'][] = ['backup_id' => $id, 'name' => $name, 'result' => $result];
+            };
+
+            if ((string) $row['file_path'] === '' || !is_readable($path)) {
+                $summary['unreadable']++;
+                $note('file missing on disk — left untouched');
+                continue;
+            }
+
+            $payload = (string) file_get_contents($path);
+            $actual  = hash('sha256', $payload);
+
+            if ($actual === (string) $row['checksum']) {
+                $summary['already_ok']++;
+                $note('checksum already matches');
+                continue;
+            }
+
+            // The file differs from the recorded checksum. Only trust it if it
+            // is provably a genuine, intact backup before rewriting anything.
+            try {
+                $sql       = self::unpack($payload);                 // GCM-authenticated
+                $wellFormed = str_contains($sql, 'CREATE TABLE')
+                    && str_contains($sql, 'attendance_records')
+                    && !self::isMariaDbDump($sql);
+            } catch (Throwable) {
+                $summary['corrupt']++;
+                $note('file will not decrypt — genuinely corrupt, NOT repaired');
+                continue;
+            }
+
+            if (!$wellFormed) {
+                $summary['corrupt']++;
+                $note('decrypts but is not a well-formed L-SIAMS dump — NOT repaired');
+                continue;
+            }
+
+            Database::instance()->update('backups', [
+                'checksum'    => $actual,
+                'file_size'   => strlen($payload),
+                'table_count' => substr_count($sql, 'CREATE TABLE'),
+            ], ['backup_id' => $id]);
+
+            $summary['repaired']++;
+            $note('checksum re-derived from the file on disk');
+        }
+
+        return $summary;
     }
 
     /**

@@ -137,8 +137,8 @@ final class BackupController extends Controller
         $result = BackupService::restore($request->routeInt('id'), $this->requireUserId());
 
         return $this->json($result, sprintf(
-            'Database restored (%d statements). A safety backup (%s) was taken first.',
-            $result['statements'],
+            'Database restored (%d tables). A safety backup (%s) was taken first.',
+            $result['tables'],
             $result['safety_backup']
         ));
     }
