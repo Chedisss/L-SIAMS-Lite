@@ -26,6 +26,7 @@ $fieldsByType = [
     // range and the section both narrow it further.
     'subject'             => ['range', 'subject_id', 'grade_level_id', 'section_id'],
     'section_daily'       => ['date', 'section_id'],
+    'sf2'                 => ['date', 'section_id'],
     'section_summary'     => ['range', 'grade_level_id', 'section_id'],
     'section_comparison'  => ['range', 'grade_level_id'],
     'adviser'             => ['range', 'teacher_id'],
@@ -51,6 +52,7 @@ $typeDescriptions = [
     'teacher_time_in'     => 'When each teacher timed in (fingerprint) and out of each class, against the schedule.',
     'subject'             => 'One subject, day by day.',
     'section_daily'       => 'Printable roll-call sheet.',
+    'sf2'                 => 'DepEd School Form 2 for one section, by month (pick any day in the month).',
     'section_summary'     => 'Per-section totals.',
     'section_comparison'  => 'Sections in a grade, compared.',
     'adviser'             => 'An adviser\'s advisory class.',
@@ -70,7 +72,7 @@ $typeDescriptions = [
 $tabs = [
     'students' => ['Students', 'fa-user-graduate',   ['student_summary', 'daily', 'weekly', 'monthly', 'student', 'subject']],
     'teachers' => ['Teachers', 'fa-fingerprint'    , ['teacher_time_in', 'teacher', 'adviser']],
-    'sections' => ['Sections', 'fa-clipboard-user',  ['section_daily', 'section_summary', 'section_comparison', 'section_roster_rfid', 'chronic_absence']],
+    'sections' => ['Sections', 'fa-clipboard-user',  ['section_daily', 'sf2', 'section_summary', 'section_comparison', 'section_roster_rfid', 'chronic_absence']],
     'system'   => ['System',   'fa-shield-halved',   ['device_uptime', 'audit', 'security']],
 ];
 
@@ -86,6 +88,7 @@ $shortLabels = [
     'teacher'             => 'Sessions',
     'adviser'             => 'Adviser',
     'section_daily'       => 'Daily sheet',
+    'sf2'                 => 'School Form 2',
     'section_summary'     => 'Summary',
     'section_comparison'  => 'Compare',
     'section_roster_rfid' => 'RFID roster',

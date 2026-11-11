@@ -186,6 +186,8 @@ return static function (Database $db): void {
     $settings = [
         ['school',     'school.name',                 'L-SIAMS Academy', 'string', 'School name', 'Appears on reports and the sign-in page.', 0, null, null],
         ['school',     'school.address',              '',                'string', 'School address', 'Printed on report headers.', 0, null, null],
+        ['school',     'school.deped_id',             '',                'string', 'DepEd School ID', 'The government School ID printed on School Form 2 (SF2).', 0, null, null],
+        ['school',     'school.head_name',            '',                'string', 'School Head / Principal', 'Printed as the attesting official on School Form 2 (SF2).', 0, null, null],
         ['school',     'school.contact',              '',                'string', 'Contact number', null, 0, null, null],
 
         ['attendance', 'attendance.time_in_window_open',    '10', 'int', 'Tap-in opens (minutes before start)', 'Default for new schedules; each schedule may override it.', 0, '0', '180'],

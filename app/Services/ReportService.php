@@ -9,6 +9,7 @@ use App\Core\Config;
 use App\Core\Database;
 use App\Core\Exceptions\ValidationException;
 use App\Services\Export\PdfWriter;
+use App\Services\Export\Sf2Writer;
 use App\Services\Export\XlsxWriter;
 
 /**
@@ -30,6 +31,7 @@ final class ReportService
         'teacher_time_in'       => 'Teacher Time In & Out',
         'subject'               => 'Subject Attendance',
         'section_daily'         => 'Section Daily Attendance Sheet',
+        'sf2'                   => 'School Form 2 (SF2)',
         'section_summary'       => 'Section Attendance Summary',
         'section_comparison'    => 'Section Comparison',
         'adviser'               => 'Adviser Report',
@@ -63,6 +65,7 @@ final class ReportService
             'teacher_time_in'            => self::teacherTimeInReport($filters, $from, $to),
             'subject'                    => self::subjectReport($filters, $from, $to),
             'section_daily'              => self::sectionDailySheet($filters),
+            'sf2'                        => self::schoolFormTwo($filters),
             'section_summary'            => self::sectionSummary($filters, $from, $to),
             'section_comparison'         => self::sectionComparison($filters, $from, $to),
             'adviser'                    => self::adviserReport($filters, $from, $to),
@@ -929,6 +932,227 @@ final class ReportService
         ];
     }
 
+    /**
+     * DepEd School Form 2 (SF2) — monthly daily attendance for one section.
+     *
+     * One mark per learner per class day: blank = present, "x" = absent,
+     * "T" = tardy. A learner counts present for the day if they have any
+     * attendance at all (any non-Absent record); a learner seen only late is
+     * tardy; a learner with no record, or only Absent records, is absent.
+     * Males and females are listed separately, each with a per-day present
+     * count, as the form requires. The month is whichever month the chosen
+     * date falls in, and the class days are the dates the section actually
+     * held sessions.
+     *
+     * Returns the usual flat {headers, rows} so the preview and the generic
+     * exporters keep working, plus a structured 'sf2' payload the SF2 writers
+     * render into the official form.
+     *
+     * @param array<string,mixed> $filters
+     * @return array<string,mixed>
+     */
+    private static function schoolFormTwo(array $filters): array
+    {
+        $sectionId = (int) ($filters['section_id'] ?? 0);
+
+        if ($sectionId <= 0) {
+            throw new ValidationException(['section_id' => ['Select a section for the School Form 2.']]);
+        }
+
+        $section = AcademicStructureService::findSection($sectionId);
+
+        if ($section === null) {
+            throw new ValidationException(['section_id' => ['Section not found.']]);
+        }
+
+        // Any day within the target month selects the month.
+        $anchor     = (string) ($filters['date'] ?? ($filters['date_from'] ?? Clock::today()));
+        $ts         = strtotime($anchor) ?: time();
+        $ym         = date('Y-m', $ts);
+        $monthLabel = strtoupper(date('F', $ts));
+
+        $db = Database::instance();
+
+        // Class days: the distinct dates the section actually held sessions in
+        // the month, in order — the form's "No. of Days of Classes".
+        $dayRows = $db->select(
+            "SELECT DISTINCT session_date AS d
+               FROM attendance_sessions
+              WHERE section_id = :s AND strftime('%Y-%m', session_date) = :ym
+              ORDER BY session_date",
+            ['s' => $sectionId, 'ym' => $ym]
+        );
+
+        $letters = [1 => 'M', 2 => 'T', 3 => 'W', 4 => 'TH', 5 => 'F', 6 => 'S', 7 => 'S'];
+        $days    = [];
+
+        foreach ($dayRows as $r) {
+            $dts    = strtotime((string) $r['d']) ?: $ts;
+            $days[] = [
+                'date' => (string) $r['d'],
+                'dom'  => (int) date('j', $dts),
+                'dow'  => $letters[(int) date('N', $dts)] ?? '',
+            ];
+        }
+
+        // Roster, split by sex, ordered as the form lists them.
+        $roster = $db->select(
+            "SELECT student_id, student_number, last_name, first_name, middle_name, gender
+               FROM students
+              WHERE section_id = :s AND deleted_at IS NULL AND status = 'active'
+              ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE",
+            ['s' => $sectionId]
+        );
+
+        // Every record in the month, collapsed to one status set per student
+        // per day.
+        $recs = $db->select(
+            "SELECT ar.student_id AS sid, s.session_date AS d, ar.final_status AS st
+               FROM attendance_records ar
+               JOIN attendance_sessions s ON s.session_id = ar.session_id
+              WHERE s.section_id = :s AND strftime('%Y-%m', s.session_date) = :ym",
+            ['s' => $sectionId, 'ym' => $ym]
+        );
+
+        $present = ['Present', 'Left Early', 'Excused', 'Official Business', 'Incomplete'];
+        $seen    = [];
+
+        foreach ($recs as $r) {
+            $sid = (int) $r['sid'];
+            $d   = (string) $r['d'];
+            $st  = (string) $r['st'];
+            $seen[$sid][$d] ??= ['present' => false, 'late' => false];
+
+            if (in_array($st, $present, true)) {
+                $seen[$sid][$d]['present'] = true;
+            } elseif (strcasecmp($st, 'Late') === 0) {
+                $seen[$sid][$d]['late'] = true;
+            }
+        }
+
+        $markFor = static function (int $sid, string $date) use ($seen): string {
+            $s = $seen[$sid][$date] ?? null;
+            if ($s === null)      return 'x';   // no record at all -> absent
+            if ($s['present'])    return '';    // present (blank)
+            if ($s['late'])       return 'T';   // tardy
+            return 'x';                          // only Absent records
+        };
+
+        $males   = [];
+        $females = [];
+
+        foreach ($roster as $st) {
+            $middle = trim((string) ($st['middle_name'] ?? ''));
+            $name   = trim(sprintf('%s, %s%s', $st['last_name'], $st['first_name'], $middle === '' ? '' : ' ' . $middle));
+            $marks  = [];
+            $absent = 0;
+            $tardy  = 0;
+
+            foreach ($days as $day) {
+                $m       = $markFor((int) $st['student_id'], $day['date']);
+                $marks[] = $m;
+                if ($m === 'x')      $absent++;
+                elseif ($m === 'T')  $tardy++;
+            }
+
+            $entry = ['name' => $name, 'marks' => $marks, 'absent' => $absent, 'tardy' => $tardy];
+
+            if (strcasecmp((string) $st['gender'], 'Male') === 0) {
+                $males[] = $entry;
+            } else {
+                // SF2 has only two columns; a learner who is not recorded Male
+                // is listed under Female rather than dropped from the register.
+                $females[] = $entry;
+            }
+        }
+
+        // Per-day present totals — a learner present OR tardy counts present.
+        $perDay = static function (array $block) use ($days): array {
+            $totals = array_fill(0, count($days), 0);
+            foreach ($block as $e) {
+                foreach ($e['marks'] as $i => $m) {
+                    if ($m !== 'x') {
+                        $totals[$i]++;
+                    }
+                }
+            }
+            return $totals;
+        };
+
+        $maleTotals   = $perDay($males);
+        $femaleTotals = $perDay($females);
+        $combined     = [];
+        foreach ($days as $i => $_) {
+            $combined[$i] = ($maleTotals[$i] ?? 0) + ($femaleTotals[$i] ?? 0);
+        }
+
+        $grade = $section['numeric_level'] ?: ($section['grade_level_code'] ?? '');
+
+        $sf2 = [
+            'school_id'       => SettingsService::string('school.deped_id', ''),
+            'school_name'     => SettingsService::schoolName(),
+            'school_year'     => self::schoolYearLabel($section['school_year_id'] ?? null) ?? '',
+            'month'           => $monthLabel,
+            'grade'           => (string) $grade,
+            'section'         => (string) $section['section_name'],
+            'adviser'         => (string) ($section['adviser_name'] ?? ''),
+            'head'            => SettingsService::string('school.head_name', ''),
+            'days'            => $days,
+            'males'           => $males,
+            'females'         => $females,
+            'male_totals'     => $maleTotals,
+            'female_totals'   => $femaleTotals,
+            'combined_totals' => $combined,
+        ];
+
+        // Flat version so the preview and the generic exporters still work.
+        $headers = array_merge(
+            ['#', 'Learner', 'Sex'],
+            array_map(static fn (array $d): string => (string) $d['dom'], $days),
+            ['Absent', 'Tardy']
+        );
+
+        $rows = [];
+        $push = static function (array $block, string $sex) use (&$rows): void {
+            foreach ($block as $i => $e) {
+                $rows[] = array_merge(
+                    [$i + 1, $e['name'], $sex],
+                    $e['marks'],
+                    [$e['absent'] ?: '', $e['tardy'] ?: '']
+                );
+            }
+        };
+        $push($males, 'M');
+        $push($females, 'F');
+
+        return [
+            'title'    => sprintf('School Form 2 (SF2) — %s %s %s', (string) $section['section_code'], $monthLabel, $sf2['school_year']),
+            'subtitle' => sprintf(
+                '%s · Grade %s %s · %d class day(s) · Adviser: %s',
+                $monthLabel,
+                (string) $grade,
+                (string) $section['section_name'],
+                count($days),
+                $sf2['adviser'] !== '' ? $sf2['adviser'] : 'unassigned'
+            ),
+            'headers'    => $headers,
+            'rows'       => $rows,
+            'statistics' => [
+                'Learners'   => count($males) + count($females),
+                'Male'       => count($males),
+                'Female'     => count($females),
+                'Class days' => count($days),
+            ],
+            'meta'   => [
+                'Section'     => (string) $section['section_code'],
+                'Month'       => $monthLabel,
+                'School Year' => (string) $sf2['school_year'],
+            ],
+            'layout' => 'sf2',
+            'sf2'    => $sf2,
+        ];
+    }
+
     /** @param array<string,mixed> $filters @return array<string,mixed> */
     private static function sectionSummary(array $filters, string $from, string $to): array
     {
@@ -1246,22 +1470,28 @@ final class ReportService
         // name splitting one column into two. None of that is recoverable by
         // the person who opens it, because nothing in the file records what it
         // was supposed to say.
+        $isSf2 = ($report['layout'] ?? null) === 'sf2';
+
         return match ($format) {
             'xlsx' => [
-                'content'  => XlsxWriter::build($report['headers'], $report['rows'], mb_substr((string) $report['title'], 0, 31), (string) $report['title']),
+                'content'  => $isSf2
+                    ? Sf2Writer::build($report['sf2'])
+                    : XlsxWriter::build($report['headers'], $report['rows'], mb_substr((string) $report['title'], 0, 31), (string) $report['title']),
                 'filename' => sprintf('%s-%s.xlsx', $slug, $timestamp),
                 'mime'     => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             ],
             'pdf' => [
-                'content'  => PdfWriter::table(
-                    (string) $report['title'],
-                    $report['headers'],
-                    $report['rows'],
-                    (string) $report['subtitle'],
-                    $report['meta'],
-                    $report['statistics'],
-                    SettingsService::schoolName()
-                ),
+                'content'  => $isSf2
+                    ? PdfWriter::schoolFormTwo($report['sf2'], SettingsService::schoolName())
+                    : PdfWriter::table(
+                        (string) $report['title'],
+                        $report['headers'],
+                        $report['rows'],
+                        (string) $report['subtitle'],
+                        $report['meta'],
+                        $report['statistics'],
+                        SettingsService::schoolName()
+                    ),
                 'filename' => sprintf('%s-%s.pdf', $slug, $timestamp),
                 'mime'     => 'application/pdf',
             ],

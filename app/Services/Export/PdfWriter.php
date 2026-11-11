@@ -95,6 +95,248 @@ final class PdfWriter
     }
 
     /**
+     * Render a DepEd School Form 2 (SF2) as a bordered monthly register.
+     *
+     * One landscape grid: the header block, a two-row column header (date over
+     * day letter), the male and female registers each with a per-day present
+     * count, a combined total, a short legend, and the certification lines. A
+     * long roster flows onto further pages, repeating the column header. The
+     * data shape is the 'sf2' payload from ReportService::schoolFormTwo.
+     *
+     * @param array<string,mixed> $sf2
+     */
+    public static function schoolFormTwo(array $sf2, string $schoolName = 'L-SIAMS'): string
+    {
+        $writer = new self('School Form 2 (SF2)', '', [], $schoolName);
+        return $writer->renderSf2($sf2);
+    }
+
+    /** @param array<string,mixed> $sf2 */
+    private function renderSf2(array $sf2): string
+    {
+        /** @var list<array{date:string,dom:int,dow:string}> $days */
+        $days = $sf2['days'] ?? [];
+        $dayN = max(count($days), 1);
+
+        $left   = self::MARGIN;
+        $right  = self::PAGE_WIDTH - self::MARGIN;
+        $usable = $right - $left;
+
+        $wNum = 20.0;
+        $wName = 150.0;
+        $wAbs = 30.0;
+        $wTar = 30.0;
+        $wRem = 80.0;
+        $dayW = max(12.0, ($usable - $wNum - $wName - $wAbs - $wTar - $wRem) / $dayN);
+
+        // Left edge x of each column: #, name, day0..dayN-1, absent, tardy, remarks.
+        $edges = [$left, $left + $wNum, $left + $wNum + $wName];
+        for ($i = 1; $i <= $dayN; $i++) {
+            $edges[] = $edges[count($edges) - 1] + $dayW;
+        }
+        $edges[] = $edges[count($edges) - 1] + $wAbs;
+        $edges[] = $edges[count($edges) - 1] + $wTar;
+        $edges[] = $edges[count($edges) - 1] + $wRem;
+        $gridRight = $edges[count($edges) - 1];
+        $absIdx = 2 + $dayN;      // index into $edges of the ABSENT column's left edge
+        $rh = 13.5;
+
+        $this->startPage(false);
+        $this->sf2Header($sf2, $gridRight);
+
+        // Column header, repeated on each page.
+        $drawColHeader = function () use (&$days, $dayN, $edges, $absIdx, $rh): void {
+            $top = $this->cursorY;
+            $h1  = $top;
+            $h2  = $top - $rh;
+            // vertical separators for both header rows
+            for ($k = 0; $k < count($edges); $k++) {
+                $this->line($edges[$k], $top, $edges[$k], $top - 2 * $rh, 0.3, 0.3, 0.3);
+            }
+            $this->line($edges[0], $top, $edges[count($edges) - 1], $top, 0.3, 0.3, 0.3);
+            $this->line($edges[0], $h2, $edges[count($edges) - 1], $h2, 0.3, 0.3, 0.3);
+            $this->line($edges[0], $top - 2 * $rh, $edges[count($edges) - 1], $top - 2 * $rh, 0.3, 0.3, 0.3);
+            // # and NAME span both rows
+            $this->sf2CellText($edges[0], $edges[1], $top - $rh - 3, '#', 'center', 7.5, true);
+            $this->sf2CellText($edges[1] + 2, $edges[2], $top - $rh - 3, "LEARNER'S NAME (Last, First, Middle)", 'left', 7.5, true);
+            // day numbers (row 1) + letters (row 2)
+            foreach ($days as $i => $d) {
+                $this->sf2CellText($edges[2 + $i], $edges[3 + $i], $h1 - 10, (string) $d['dom'], 'center', 7, true);
+                $this->sf2CellText($edges[2 + $i], $edges[3 + $i], $h2 - 10, (string) $d['dow'], 'center', 6.5, false);
+            }
+            // ABSENT / TARDY / REMARKS
+            $this->sf2CellText($edges[$absIdx], $edges[$absIdx + 1], $h2 - 10, 'ABS', 'center', 6.5, true);
+            $this->sf2CellText($edges[$absIdx + 1], $edges[$absIdx + 2], $h2 - 10, 'TDY', 'center', 6.5, true);
+            $this->sf2CellText($edges[$absIdx + 2], $edges[$absIdx + 3], $top - $rh - 3, 'REMARKS', 'center', 6.5, true);
+            $this->cursorY = $top - 2 * $rh;
+        };
+        $drawColHeader();
+
+        // A single grid data row.
+        $drawGridRow = function (string $no, string $name, array $marks, string $absent, string $tardy, bool $bold = false) use ($edges, $dayN, $absIdx, $rh): void {
+            $top = $this->cursorY;
+            $bot = $top - $rh;
+            foreach ($marks as $i => $m) {
+                if ($m === 'T') {
+                    // tardy: shade the cell
+                    $this->rect($edges[2 + $i], $bot, $edges[3 + $i] - $edges[2 + $i], $rh, 0.75, 0.75, 0.75);
+                }
+            }
+            for ($k = 0; $k < count($edges); $k++) {
+                $this->line($edges[$k], $top, $edges[$k], $bot, 0.3, 0.3, 0.3);
+            }
+            $this->line($edges[0], $bot, $edges[count($edges) - 1], $bot, 0.3, 0.3, 0.3);
+            $this->sf2CellText($edges[0], $edges[1], $bot + 3.5, $no, 'center', 7, $bold);
+            $this->sf2CellText($edges[1] + 2, $edges[2], $bot + 3.5, $name, 'left', 7, $bold);
+            foreach ($marks as $i => $m) {
+                if ($m === 'x') {
+                    $this->sf2CellText($edges[2 + $i], $edges[3 + $i], $bot + 3.5, 'x', 'center', 7, false);
+                }
+            }
+            $this->sf2CellText($edges[$absIdx], $edges[$absIdx + 1], $bot + 3.5, $absent, 'center', 7, $bold);
+            $this->sf2CellText($edges[$absIdx + 1], $edges[$absIdx + 2], $bot + 3.5, $tardy, 'center', 7, $bold);
+            $this->cursorY = $bot;
+        };
+
+        $pageBreak = function () use ($drawColHeader, $rh): void {
+            if ($this->cursorY < self::MARGIN + 3 * $rh) {
+                $this->finishPage();
+                $this->startPage(false);
+                $this->cursorY = self::PAGE_HEIGHT - self::MARGIN - 6;
+                $drawColHeader();
+            }
+        };
+
+        $emit = function (array $block, array $totals, string $totalLabel) use (&$pageBreak, $drawGridRow, $dayN): void {
+            foreach ($block as $i => $e) {
+                $pageBreak();
+                $drawGridRow(
+                    (string) ($i + 1),
+                    (string) $e['name'],
+                    $e['marks'] ?? [],
+                    (string) (((int) ($e['absent'] ?? 0)) ?: ''),
+                    (string) (((int) ($e['tardy'] ?? 0)) ?: '')
+                );
+            }
+            $pageBreak();
+            $marks = array_fill(0, $dayN, '');
+            $totalsTxt = [];
+            for ($i = 0; $i < $dayN; $i++) {
+                $totalsTxt[$i] = ($totals[$i] ?? 0) !== 0 ? (string) $totals[$i] : '';
+            }
+            $this->sf2TotalRow($totalLabel, $totalsTxt, $dayN);
+        };
+
+        $emit($sf2['males'] ?? [], $sf2['male_totals'] ?? [], 'MALE | TOTAL Per Day');
+        $emit($sf2['females'] ?? [], $sf2['female_totals'] ?? [], 'FEMALE | TOTAL Per Day');
+        $pageBreak();
+        $combined = [];
+        for ($i = 0; $i < $dayN; $i++) {
+            $combined[$i] = ($sf2['combined_totals'][$i] ?? 0) !== 0 ? (string) $sf2['combined_totals'][$i] : '';
+        }
+        $this->sf2TotalRow('Combined TOTAL Per Day', $combined, $dayN);
+
+        // Legend + certification.
+        $this->cursorY -= 18;
+        $this->text($left, $this->cursorY, 'Codes:  blank = Present      x = Absent      shaded cell = Tardy', 7.5, false, 0.3, 0.3, 0.3);
+        $this->cursorY -= 28;
+        $this->text($left + 20, $this->cursorY, 'I certify that this is a true and correct report.', 8, false, 0.12, 0.16, 0.23);
+        $this->cursorY -= 26;
+        $this->text($left + 40, $this->cursorY, strtoupper((string) ($sf2['adviser'] ?? '')), 9, true, 0.12, 0.16, 0.23);
+        $this->text($left + 360, $this->cursorY, strtoupper((string) ($sf2['head'] ?? '')), 9, true, 0.12, 0.16, 0.23);
+        $this->cursorY -= 11;
+        $this->text($left + 40, $this->cursorY, 'Signature of Teacher / Adviser over Printed Name', 7, false, 0.42, 0.45, 0.50);
+        $this->text($left + 360, $this->cursorY, 'Signature of School Head over Printed Name', 7, false, 0.42, 0.45, 0.50);
+
+        $this->finishPage();
+        return $this->render();
+    }
+
+    /** @param array<string,mixed> $sf2 */
+    private function sf2Header(array $sf2, float $gridRight): void
+    {
+        $left = self::MARGIN;
+        $y    = self::PAGE_HEIGHT - self::MARGIN - 8;
+        $title = 'School Form 2 (SF2) — Daily Attendance Report of Learners';
+        $this->text(($left + $gridRight) / 2 - $this->textWidth($title, 12) / 2, $y, $title, 12, true, 0.12, 0.16, 0.23);
+        $y -= 20;
+
+        $field = function (float $x, string $label, string $value, float $y): void {
+            $this->text($x, $y, $label . ':', 8, true, 0.12, 0.16, 0.23);
+            $this->text($x + $this->textWidth($label . ': ', 8) + 2, $y, $value, 8, false, 0.2, 0.2, 0.2);
+        };
+        $col2 = $left + 260;
+        $col3 = $left + 500;
+        $field($left, 'School ID', (string) ($sf2['school_id'] ?? ''), $y);
+        $field($col2, 'School Year', (string) ($sf2['school_year'] ?? ''), $y);
+        $field($col3, 'Report for the Month of', (string) ($sf2['month'] ?? ''), $y);
+        $y -= 15;
+        $field($left, 'Name of School', (string) ($sf2['school_name'] ?? ''), $y);
+        $field($col3, 'Grade & Section', trim(sprintf('Grade %s - %s', (string) ($sf2['grade'] ?? ''), (string) ($sf2['section'] ?? '')), ' -'), $y);
+
+        $this->cursorY = $y - 16;
+    }
+
+    /** @param array<int,string> $totals */
+    private function sf2TotalRow(string $label, array $totals, int $dayN): void
+    {
+        $this->drawSf2TotalRowInner($label, $totals, $dayN);
+    }
+
+    /**
+     * Draw text clipped to a cell, horizontally aligned. $yBaseline is the text
+     * baseline in PDF points.
+     */
+    private function sf2CellText(float $x1, float $x2, float $yBaseline, string $text, string $align, float $size, bool $bold): void
+    {
+        if ($text === '') {
+            return;
+        }
+        $maxW = $x2 - $x1 - 4;
+        while ($text !== '' && $this->textWidth($text, $size) > $maxW) {
+            $text = mb_substr($text, 0, -1);
+        }
+        $w = $this->textWidth($text, $size);
+        $x = match ($align) {
+            'center' => $x1 + (($x2 - $x1) - $w) / 2,
+            'right'  => $x2 - 2 - $w,
+            default  => $x1 + 2,
+        };
+        $this->text($x, $yBaseline, $text, $size, $bold, 0.12, 0.16, 0.23);
+    }
+
+    /** @param array<int,string> $totals */
+    private function drawSf2TotalRowInner(string $label, array $totals, int $dayN): void
+    {
+        // Rebuild edges the same way renderSf2 did — kept local so the totals
+        // row lines up with the grid above it.
+        $left   = self::MARGIN;
+        $usable = (self::PAGE_WIDTH - self::MARGIN) - $left;
+        $wNum = 20.0; $wName = 150.0; $wAbs = 30.0; $wTar = 30.0; $wRem = 80.0;
+        $dayW = max(12.0, ($usable - $wNum - $wName - $wAbs - $wTar - $wRem) / max($dayN, 1));
+        $edges = [$left, $left + $wNum, $left + $wNum + $wName];
+        for ($i = 1; $i <= $dayN; $i++) {
+            $edges[] = $edges[count($edges) - 1] + $dayW;
+        }
+        $edges[] = $edges[count($edges) - 1] + $wAbs;
+        $edges[] = $edges[count($edges) - 1] + $wTar;
+        $edges[] = $edges[count($edges) - 1] + $wRem;
+
+        $rh  = 13.5;
+        $top = $this->cursorY;
+        $bot = $top - $rh;
+        for ($k = 0; $k < count($edges); $k++) {
+            $this->line($edges[$k], $top, $edges[$k], $bot, 0.3, 0.3, 0.3);
+        }
+        $this->line($edges[0], $bot, $edges[count($edges) - 1], $bot, 0.3, 0.3, 0.3);
+        $this->sf2CellText($edges[0] + 2, $edges[2], $bot + 3.5, $label, 'left', 7, true);
+        foreach ($totals as $i => $t) {
+            $this->sf2CellText($edges[2 + $i], $edges[3 + $i], $bot + 3.5, (string) $t, 'center', 7, true);
+        }
+        $this->cursorY = $bot;
+    }
+
+    /**
      * A booklet: one titled sheet per entity, each starting on its own page.
      *
      * The single-table `table()` renderer answers "one report, many rows"; this
@@ -207,13 +449,15 @@ final class PdfWriter
         );
     }
 
-    private function startPage(): void
+    private function startPage(bool $branded = true): void
     {
         $this->pageNumber++;
         $this->currentPage = '';
         $this->cursorY     = self::PAGE_HEIGHT - self::MARGIN;
 
-        $this->drawDocumentHeader();
+        if ($branded) {
+            $this->drawDocumentHeader();
+        }
     }
 
     private function finishPage(): void
